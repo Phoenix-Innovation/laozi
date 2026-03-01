@@ -1,153 +1,136 @@
-// Package laozi provides a dual-constraint insight generation engine.
-// It prevents LLM hallucinations by combining hardcoded thresholds (Tier 1)
-// with optional RAG context (Tier 2).
-//
-// Usage:
-//
-//	engine := laozi.New(
-//		laozi.WithLLM("https://api.openai.com/v1", "your-api-key", "gpt-4o"),
-//		laozi.WithRAG(myRAGStore), // optional
-//	)
-//
-//	// Define your domain thresholds
-//	engine.AddCategory(laozi.Category{
-//		ID:   "revenue",
-//		Name: "Revenue Analysis",
-//		Thresholds: []laozi.Threshold{
-//			{Metric: "monthly_revenue", Min: 100000, Max: 500000, Unit: "USD"},
-//		},
-//	})
-//
-//	// Generate insights
-//	insights, err := engine.Analyze(ctx, map[string]float64{
-//		"monthly_revenue": 75000,
-//	})
+// Package laozi provides an LLM-powered insight generation engine with
+// hallucination prevention through dual-constraint architecture.
 package laozi
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
+	"sync"
+	"text/template"
+	"time"
 )
+
+// ================================================================================
+// TYPES
+// ================================================================================
 
 // Severity levels for insights
 type Severity string
 
 const (
-	SeverityWarning Severity = "warning" // Value outside threshold
-	SeveritySuccess Severity = "success" // Value within threshold
-	SeverityInfo    Severity = "info"    // Educational/informational
+	SeverityWarning Severity = "warning"
+	SeveritySuccess Severity = "success"
+	SeverityInfo    Severity = "info"
 )
 
-// Threshold defines a constraint for a metric
+// Threshold defines a metric guideline with source attribution
 type Threshold struct {
-	Metric      string  `json:"metric"`
-	Min         float64 `json:"min"`
-	Max         float64 `json:"max"`
-	OptimalMin  float64 `json:"optimal_min,omitempty"`
-	OptimalMax  float64 `json:"optimal_max,omitempty"`
-	Unit        string  `json:"unit"`
-	Source      string  `json:"source"`
-	SourceURL   string  `json:"source_url"`
-	Description string  `json:"description,omitempty"`
+	Metric    string  // e.g., "current_ratio", "glucose"
+	Min       float64 // Minimum acceptable value
+	Max       float64 // Maximum acceptable value
+	Unit      string  // e.g., "ratio", "mg/dL"
+	Source    string  // e.g., "CFA Institute", "ADA"
+	SourceURL string  // URL for reference
 }
 
-// Category groups related metrics and thresholds
+// Category represents an analysis category
 type Category struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	Thresholds  []Threshold `json:"thresholds"`
-	Educational bool        `json:"educational"` // If true, generates "Did You Know" tips
-	RAGQuery    string      `json:"rag_query,omitempty"`
+	ID          string
+	Name        string
+	Thresholds  []Threshold
+	Educational bool   // If true, generates "Did You Know" tips
+	RAGQuery    string // Optional query for RAG context
 }
 
-// Insight is the output from analysis
+// Insight is the generated output
 type Insight struct {
-	ID             string            `json:"id"`
-	CategoryID     string            `json:"category_id"`
-	CategoryName   string            `json:"category_name"`
-	Text           string            `json:"text"`
-	Severity       Severity          `json:"severity"`
-	RelatedMetrics []string          `json:"related_metrics"`
-	Reference      string            `json:"reference"`
-	SuggestedGoal  *SuggestedGoal    `json:"suggested_goal,omitempty"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
+	CategoryID string
+	Text       string
+	Severity   Severity
+	Reference  string
+	Metadata   map[string]string
 }
 
-// SuggestedGoal provides actionable targets
-type SuggestedGoal struct {
-	Metric      string  `json:"metric"`
-	Target      float64 `json:"target"`
-	Unit        string  `json:"unit"`
-	Comparison  string  `json:"comparison"` // gte, lte, eq
-	Description string  `json:"description"`
+// RAGDocument represents a retrieved document
+type RAGDocument struct {
+	Content    string
+	Source     string
+	SourceURL  string
+	Similarity float64
 }
 
-// RAGStore interface for optional vector database integration
+// RAGStore interface for vector database
 type RAGStore interface {
-	// Search returns relevant context for a query
-	Search(ctx context.Context, query string, limit int) ([]RAGResult, error)
+	Search(ctx context.Context, query string, topK int) ([]RAGDocument, error)
 }
 
-// RAGResult from vector search
-type RAGResult struct {
-	Content   string  `json:"content"`
-	Source    string  `json:"source"`
-	SourceURL string  `json:"source_url"`
-	Score     float64 `json:"score"`
-}
-
-// LLMClient interface for LLM integration
+// LLMClient interface for LLM calls
 type LLMClient interface {
 	Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error)
 }
+
+// Logger interface for observability
+type Logger interface {
+	Log(step, category, message string, data map[string]interface{})
+}
+
+// ================================================================================
+// ENGINE
+// ================================================================================
 
 // Engine is the main Laozi insight generator
 type Engine struct {
 	categories map[string]Category
 	llm        LLMClient
-	rag        RAGStore // optional
+	rag        RAGStore
 	context    map[string]interface{}
+	logger     Logger
+
+	// Templates (parsed once)
+	systemTpl     *template.Template
+	metricTpl     *template.Template
+	educationalTpl *template.Template
+	regenTpl      *template.Template
 }
 
 // New creates a new Laozi engine
-func New(opts ...Option) *Engine {
+func New(llm LLMClient, rag RAGStore) *Engine {
 	e := &Engine{
 		categories: make(map[string]Category),
 		context:    make(map[string]interface{}),
+		llm:        llm,
+		rag:        rag,
 	}
-	for _, opt := range opts {
-		opt(e)
+
+	// Parse templates at init
+	e.systemTpl = template.Must(template.New("system").Parse(SystemPromptTemplate))
+	e.metricTpl = template.Must(template.New("metric").Parse(MetricPromptTemplate))
+	e.educationalTpl = template.Must(template.New("educational").Parse(EducationalPromptTemplate))
+	e.regenTpl = template.Must(template.New("regen").Parse(RegenerationPromptTemplate))
+
+	// Set logger based on config
+	if LogEnabled {
+		e.logger = &ConsoleLogger{}
 	}
+
 	return e
 }
 
-// Option configures the engine
-type Option func(*Engine)
-
-// WithLLM sets the LLM client
-func WithLLM(client LLMClient) Option {
-	return func(e *Engine) {
-		e.llm = client
-	}
+// SetLogger overrides the default logger
+func (e *Engine) SetLogger(l Logger) {
+	e.logger = l
 }
 
-// WithRAG enables optional RAG support
-func WithRAG(store RAGStore) Option {
-	return func(e *Engine) {
-		e.rag = store
-	}
+// AddContext adds domain context
+func (e *Engine) AddContext(key string, value interface{}) {
+	e.context[key] = value
 }
 
-// WithContext adds domain context (e.g., user profile, entity info)
-func WithContext(key string, value interface{}) Option {
-	return func(e *Engine) {
-		e.context[key] = value
-	}
-}
-
-// AddCategory registers a category with its thresholds
+// AddCategory registers a category
 func (e *Engine) AddCategory(cat Category) {
 	e.categories[cat.ID] = cat
 }
@@ -155,241 +138,338 @@ func (e *Engine) AddCategory(cat Category) {
 // AddCategories registers multiple categories
 func (e *Engine) AddCategories(cats []Category) {
 	for _, cat := range cats {
-		e.categories[cat.ID] = cat
+		e.AddCategory(cat)
 	}
 }
 
-// SetContext updates engine context
-func (e *Engine) SetContext(key string, value interface{}) {
-	e.context[key] = value
-}
+// ================================================================================
+// ANALYSIS
+// ================================================================================
 
-// Analyze generates insights for the given metrics
-func (e *Engine) Analyze(ctx context.Context, metrics map[string]float64) ([]Insight, error) {
-	if e.llm == nil {
-		return nil, fmt.Errorf("LLM client not configured")
-	}
+// AnalyzeAll runs all categories in parallel (uses MaxParallelLLMCalls from config)
+func (e *Engine) AnalyzeAll(ctx context.Context, metrics map[string]float64) ([]*Insight, error) {
+	var (
+		mu       sync.Mutex
+		insights []*Insight
+		errs     []error
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, MaxParallelLLMCalls)
+	)
 
-	var insights []Insight
+	e.log("BATCH", "all", fmt.Sprintf("Starting %d categories with %d parallel", len(e.categories), MaxParallelLLMCalls), nil)
 
 	for _, cat := range e.categories {
-		insight, err := e.analyzeCategory(ctx, cat, metrics)
-		if err != nil {
-			return nil, fmt.Errorf("category %s: %w", cat.ID, err)
-		}
-		if insight != nil {
-			insights = append(insights, *insight)
-		}
+		wg.Add(1)
+		go func(c Category) {
+			defer wg.Done()
+			sem <- struct{}{}        // Acquire
+			defer func() { <-sem }() // Release
+
+			insight, err := e.Analyze(ctx, c.ID, metrics)
+			mu.Lock()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", c.ID, err))
+			} else if insight != nil {
+				insights = append(insights, insight)
+			}
+			mu.Unlock()
+		}(cat)
+	}
+
+	wg.Wait()
+
+	if len(errs) > 0 {
+		e.log("BATCH", "all", fmt.Sprintf("Completed with %d errors", len(errs)), nil)
 	}
 
 	return insights, nil
 }
 
-// AnalyzeCategory generates an insight for a specific category
-func (e *Engine) AnalyzeCategory(ctx context.Context, categoryID string, metrics map[string]float64) (*Insight, error) {
+// Analyze generates an insight for a single category
+func (e *Engine) Analyze(ctx context.Context, categoryID string, metrics map[string]float64) (*Insight, error) {
 	cat, ok := e.categories[categoryID]
 	if !ok {
 		return nil, fmt.Errorf("category not found: %s", categoryID)
 	}
+
+	// Add timeout from config
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(LLMTimeoutSeconds)*time.Second)
+	defer cancel()
+
 	return e.analyzeCategory(ctx, cat, metrics)
 }
 
 func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
-	// Build threshold guidelines text
-	guidelinesText := e.buildGuidelinesText(cat)
+	var (
+		userPrompt       string
+		expectedSeverity Severity
+	)
 
-	// Build metrics text with pre-computed comparison
-	metricsText, expectedSeverity := e.buildMetricsText(cat, metrics)
-
-	// Get RAG context if available
-	var ragContext string
-	if e.rag != nil && cat.RAGQuery != "" {
-		results, err := e.rag.Search(ctx, cat.RAGQuery, 2)
-		if err == nil && len(results) > 0 {
-			ragContext = e.buildRAGContext(results)
-		}
+	if cat.Educational {
+		userPrompt, expectedSeverity = e.buildEducationalPrompt(ctx, cat)
+	} else {
+		userPrompt, expectedSeverity = e.buildMetricPrompt(cat, metrics)
 	}
 
-	// Build prompts
-	systemPrompt := e.buildSystemPrompt()
-	userPrompt := e.buildUserPrompt(cat, guidelinesText, metricsText, ragContext, expectedSeverity)
+	e.log("GENERATE", cat.ID, "Calling LLM", map[string]interface{}{"expected": string(expectedSeverity)})
 
-	// Call LLM
-	response, err := e.llm.Chat(ctx, systemPrompt, userPrompt)
+	// STEP 1: Generate
+	response, err := e.llm.Chat(ctx, SystemPromptTemplate, userPrompt)
 	if err != nil {
+		e.log("GENERATE", cat.ID, "LLM failed", map[string]interface{}{"error": err.Error()})
 		return nil, fmt.Errorf("LLM call failed: %w", err)
 	}
 
-	// Parse response
-	return e.parseResponse(response, cat)
-}
-
-func (e *Engine) buildGuidelinesText(cat Category) string {
-	var sb strings.Builder
-	for _, t := range cat.Thresholds {
-		sb.WriteString(fmt.Sprintf("📊 %s GUIDELINE:\n", strings.ToUpper(t.Metric)))
-		sb.WriteString(fmt.Sprintf("   Range: %.2f - %.2f %s\n", t.Min, t.Max, t.Unit))
-		if t.OptimalMin > 0 || t.OptimalMax > 0 {
-			sb.WriteString(fmt.Sprintf("   Optimal: %.2f - %.2f %s\n", t.OptimalMin, t.OptimalMax, t.Unit))
-		}
-		sb.WriteString(fmt.Sprintf("   Source: %s\n", t.Source))
-		sb.WriteString(fmt.Sprintf("   URL: %s\n", t.SourceURL))
-		if t.Description != "" {
-			sb.WriteString(fmt.Sprintf("   Note: %s\n", t.Description))
-		}
-		sb.WriteString("\n")
+	// STEP 2: Parse
+	insight, err := e.parseResponse(response, cat.ID)
+	if err != nil {
+		e.log("PARSE", cat.ID, "Parse failed", map[string]interface{}{"error": err.Error()})
+		return nil, err
 	}
-	return sb.String()
-}
+	e.log("PARSE", cat.ID, "OK", map[string]interface{}{"severity": string(insight.Severity)})
 
-func (e *Engine) buildMetricsText(cat Category, metrics map[string]float64) (string, Severity) {
-	var sb strings.Builder
-	expectedSeverity := SeveritySuccess
+	// STEP 3: Validate
+	validationErr := e.validateInsight(insight, cat, expectedSeverity)
+	if validationErr == nil {
+		e.log("VALIDATE", cat.ID, "✓ PASS", nil)
+		return insight, nil
+	}
+	e.log("VALIDATE", cat.ID, "✗ FAIL", map[string]interface{}{"error": validationErr.Error()})
 
-	for _, t := range cat.Thresholds {
-		val, ok := metrics[t.Metric]
-		if !ok {
+	// STEP 4: Regenerate (up to MaxRetries from config)
+	for attempt := 1; attempt <= MaxRetries; attempt++ {
+		e.log("REGENERATE", cat.ID, fmt.Sprintf("Attempt %d/%d", attempt, MaxRetries), nil)
+
+		regenPrompt := e.buildRegenPrompt(cat, metrics, expectedSeverity, validationErr.Error())
+		response, err = e.llm.Chat(ctx, "You are regenerating a failed insight. Follow instructions EXACTLY.", regenPrompt)
+		if err != nil {
 			continue
 		}
 
-		// Pre-compute comparison
-		var status string
-		if val < t.Min {
-			status = fmt.Sprintf("BELOW minimum (%.2f < %.2f)", val, t.Min)
-			expectedSeverity = SeverityWarning
-		} else if val > t.Max {
-			status = fmt.Sprintf("ABOVE maximum (%.2f > %.2f)", val, t.Max)
-			expectedSeverity = SeverityWarning
-		} else {
-			status = fmt.Sprintf("WITHIN range (%.2f - %.2f)", t.Min, t.Max)
+		insight, err = e.parseResponse(response, cat.ID)
+		if err != nil {
+			continue
 		}
 
-		sb.WriteString(fmt.Sprintf("- %s: %.2f %s → %s\n", t.Metric, val, t.Unit, status))
+		validationErr = e.validateInsight(insight, cat, expectedSeverity)
+		if validationErr == nil {
+			e.log("REGENERATE", cat.ID, "✓ SUCCESS", nil)
+			return insight, nil
+		}
 	}
 
-	if cat.Educational {
-		expectedSeverity = SeverityInfo
+	e.log("REGENERATE", cat.ID, "✗ EXHAUSTED", map[string]interface{}{"attempts": MaxRetries})
+	return nil, fmt.Errorf("validation failed after %d attempts", MaxRetries)
+}
+
+// ================================================================================
+// PROMPT BUILDING
+// ================================================================================
+
+func (e *Engine) buildMetricPrompt(cat Category, metrics map[string]float64) (string, Severity) {
+	var guidelines, metricsText, comparison strings.Builder
+	expectedSeverity := SeveritySuccess
+
+	for _, t := range cat.Thresholds {
+		guidelines.WriteString(fmt.Sprintf("📊 %s: Range %.2f - %.2f %s\n   Source: %s\n   URL: %s\n\n",
+			strings.ToUpper(t.Metric), t.Min, t.Max, t.Unit, t.Source, t.SourceURL))
+
+		if val, ok := metrics[t.Metric]; ok {
+			metricsText.WriteString(fmt.Sprintf("- %s: %.2f %s\n", t.Metric, val, t.Unit))
+
+			// Pre-compute comparison
+			if val < t.Min {
+				comparison.WriteString(fmt.Sprintf("%s: %.2f < %.2f (BELOW minimum) → severity = warning\n",
+					t.Metric, val, t.Min))
+				expectedSeverity = SeverityWarning
+			} else if val > t.Max {
+				comparison.WriteString(fmt.Sprintf("%s: %.2f > %.2f (ABOVE maximum) → severity = warning\n",
+					t.Metric, val, t.Max))
+				expectedSeverity = SeverityWarning
+			} else {
+				comparison.WriteString(fmt.Sprintf("%s: %.2f within [%.2f - %.2f] → severity = success\n",
+					t.Metric, val, t.Min, t.Max))
+			}
+		}
 	}
 
-	return sb.String(), expectedSeverity
-}
-
-func (e *Engine) buildRAGContext(results []RAGResult) string {
-	var sb strings.Builder
-	sb.WriteString("ADDITIONAL REFERENCES:\n")
-	for i, r := range results {
-		sb.WriteString(fmt.Sprintf("%d. %s\n   Source: %s - %s\n\n", i+1, r.Content, r.Source, r.SourceURL))
-	}
-	return sb.String()
-}
-
-func (e *Engine) buildSystemPrompt() string {
-	return `You are an insight generator using the Laozi dual-constraint system.
-You MUST generate exactly ONE insight based on the provided thresholds and data.
-
-RULES:
-1. Use ONLY the thresholds and references provided
-2. Never invent data or thresholds
-3. Compare actual values to thresholds explicitly
-4. Include the source URL in your reference
-
-SEVERITY:
-- "warning" = value OUTSIDE the threshold range
-- "success" = value WITHIN the threshold range  
-- "info" = educational tip (for educational categories)
-
-Respond with ONLY valid JSON.`
-}
-
-func (e *Engine) buildUserPrompt(cat Category, guidelines, metrics, ragContext string, severity Severity) string {
-	contextJSON, _ := json.Marshal(e.context)
-
-	if cat.Educational {
-		return fmt.Sprintf(`CATEGORY: %s (%s)
-TYPE: Educational "Did You Know" tip
-
-CONTEXT:
-%s
-
-%s
-
-OUTPUT (severity MUST be "info"):
-{
-  "insight": {
-    "text": "Did you know? [educational fact]",
-    "severity": "info",
-    "reference": "[Source] - [URL]"
-  }
-}`, cat.ID, cat.Name, string(contextJSON), ragContext)
+	data := map[string]string{
+		"CategoryID":       cat.ID,
+		"CategoryName":     cat.Name,
+		"Guidelines":       guidelines.String(),
+		"Metrics":          metricsText.String(),
+		"Comparison":       comparison.String(),
+		"ExpectedSeverity": string(expectedSeverity),
 	}
 
-	return fmt.Sprintf(`CATEGORY: %s (%s)
-
-GUIDELINES (Tier 1 - Mandatory):
-%s
-
-%s
-
-CONTEXT:
-%s
-
-ACTUAL VALUES WITH COMPARISON:
-%s
-
-EXPECTED SEVERITY: %s
-
-OUTPUT (use severity="%s"):
-{
-  "insight": {
-    "text": "[State value, compare to threshold, give advice]",
-    "severity": "%s",
-    "reference": "[Source from guidelines] - [URL]",
-    "suggested_goal": { "metric": "%s", "target": [threshold_value], "unit": "[unit]", "comparison": "gte", "description": "..." }
-  }
-}`,
-		cat.ID, cat.Name,
-		guidelines,
-		ragContext,
-		string(contextJSON),
-		metrics,
-		severity, severity, severity,
-		cat.Thresholds[0].Metric)
+	return e.executeTemplate(e.metricTpl, data), expectedSeverity
 }
 
-func (e *Engine) parseResponse(response string, cat Category) (*Insight, error) {
-	// Clean JSON markers
-	response = strings.TrimPrefix(response, "```json")
-	response = strings.TrimPrefix(response, "```")
-	response = strings.TrimSuffix(response, "```")
-	response = strings.TrimSpace(response)
+func (e *Engine) buildEducationalPrompt(ctx context.Context, cat Category) (string, Severity) {
+	var refs strings.Builder
+
+	if RAGEnabled && e.rag != nil && cat.RAGQuery != "" {
+		docs, err := e.rag.Search(ctx, cat.RAGQuery, RAGTopK)
+		if err == nil {
+			for i, doc := range docs {
+				if doc.Similarity >= RAGMinSimilarity {
+					refs.WriteString(fmt.Sprintf("[%d] %s\n    Source: %s - %s\n\n",
+						i+1, doc.Content, doc.Source, doc.SourceURL))
+				}
+			}
+		}
+	}
+
+	data := map[string]string{
+		"CategoryID":   cat.ID,
+		"CategoryName": cat.Name,
+		"References":   refs.String(),
+	}
+
+	return e.executeTemplate(e.educationalTpl, data), SeverityInfo
+}
+
+func (e *Engine) buildRegenPrompt(cat Category, metrics map[string]float64, expected Severity, validationError string) string {
+	metricPrompt, _ := e.buildMetricPrompt(cat, metrics)
+
+	data := map[string]string{
+		"Error":            validationError,
+		"CategoryID":       cat.ID,
+		"Guidelines":       "", // Already in metricPrompt
+		"Metrics":          metricPrompt,
+		"ExpectedSeverity": string(expected),
+	}
+
+	return e.executeTemplate(e.regenTpl, data)
+}
+
+func (e *Engine) executeTemplate(tpl *template.Template, data map[string]string) string {
+	var buf strings.Builder
+	_ = tpl.Execute(&buf, data)
+	return buf.String()
+}
+
+// ================================================================================
+// VALIDATION
+// ================================================================================
+
+func (e *Engine) validateInsight(insight *Insight, cat Category, expected Severity) error {
+	if insight == nil {
+		return fmt.Errorf("nil insight")
+	}
+
+	// Structure checks
+	if len(insight.Text) < MinInsightTextLen {
+		return fmt.Errorf("text too short: %d < %d", len(insight.Text), MinInsightTextLen)
+	}
+
+	// Placeholder check
+	for _, p := range InvalidPlaceholders {
+		if strings.Contains(insight.Text, p) {
+			return fmt.Errorf("contains placeholder: %s", p)
+		}
+	}
+
+	// Severity check
+	validSeverity := false
+	for _, s := range ValidSeverities {
+		if insight.Severity == s {
+			validSeverity = true
+			break
+		}
+	}
+	if !validSeverity {
+		return fmt.Errorf("invalid severity: %s", insight.Severity)
+	}
+
+	// Reference checks
+	if RequireReference && insight.Reference == "" {
+		return fmt.Errorf("missing reference")
+	}
+	if RequireURL && !strings.Contains(insight.Reference, "http") {
+		return fmt.Errorf("reference missing URL")
+	}
+
+	// Semantic check: severity must match expected (for metric categories)
+	if EnforceSeverityMatch && !cat.Educational && insight.Severity != expected {
+		return fmt.Errorf("severity mismatch: got %s, expected %s", insight.Severity, expected)
+	}
+
+	return nil
+}
+
+// ================================================================================
+// PARSING
+// ================================================================================
+
+func (e *Engine) parseResponse(response, categoryID string) (*Insight, error) {
+	// Extract JSON from response
+	jsonRegex := regexp.MustCompile(`\{[\s\S]*"insight"[\s\S]*\}`)
+	match := jsonRegex.FindString(response)
+	if match == "" {
+		return nil, fmt.Errorf("no JSON found in response")
+	}
 
 	var result struct {
 		Insight struct {
-			Text          string         `json:"text"`
-			Severity      Severity       `json:"severity"`
-			Reference     string         `json:"reference"`
-			SuggestedGoal *SuggestedGoal `json:"suggested_goal"`
+			Text      string `json:"text"`
+			Severity  string `json:"severity"`
+			Reference string `json:"reference"`
 		} `json:"insight"`
 	}
 
-	if err := json.Unmarshal([]byte(response), &result); err != nil {
-		return nil, fmt.Errorf("parse error: %w", err)
-	}
-
-	// Extract related metrics
-	var relatedMetrics []string
-	for _, t := range cat.Thresholds {
-		relatedMetrics = append(relatedMetrics, t.Metric)
+	if err := json.Unmarshal([]byte(match), &result); err != nil {
+		return nil, fmt.Errorf("JSON parse error: %w", err)
 	}
 
 	return &Insight{
-		ID:             fmt.Sprintf("%s-001", cat.ID),
-		CategoryID:     cat.ID,
-		CategoryName:   cat.Name,
-		Text:           result.Insight.Text,
-		Severity:       result.Insight.Severity,
-		RelatedMetrics: relatedMetrics,
-		Reference:      result.Insight.Reference,
-		SuggestedGoal:  result.Insight.SuggestedGoal,
+		CategoryID: categoryID,
+		Text:       result.Insight.Text,
+		Severity:   Severity(result.Insight.Severity),
+		Reference:  result.Insight.Reference,
+		Metadata:   make(map[string]string),
 	}, nil
+}
+
+// ================================================================================
+// LOGGING
+// ================================================================================
+
+func (e *Engine) log(step, category, message string, data map[string]interface{}) {
+	if e.logger != nil {
+		e.logger.Log(step, category, message, data)
+	}
+}
+
+// ConsoleLogger prints to stdout
+type ConsoleLogger struct{}
+
+func (c *ConsoleLogger) Log(step, category, message string, data map[string]interface{}) {
+	var timestamp string
+	if LogTimestamps {
+		timestamp = time.Now().Format("15:04:05") + " "
+	}
+
+	dataStr := ""
+	if len(data) > 0 {
+		pairs := make([]string, 0, len(data))
+		for k, v := range data {
+			pairs = append(pairs, fmt.Sprintf("%s=%v", k, v))
+		}
+		dataStr = " {" + strings.Join(pairs, ", ") + "}"
+	}
+
+	fmt.Printf("%s[%s] %s: %s%s\n", timestamp, step, category, message, dataStr)
+}
+
+// ================================================================================
+// HELPERS
+// ================================================================================
+
+// GetAPIKey returns the API key from environment or config
+func GetAPIKey() string {
+	if key := os.Getenv("LAOZI_API_KEY"); key != "" {
+		return key
+	}
+	return LLMAPIKey
 }

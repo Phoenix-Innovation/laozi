@@ -7,113 +7,111 @@ import (
 	"strings"
 )
 
-// InMemoryRAG is a simple in-memory RAG store using cosine similarity
+// ================================================================================
+// IN-MEMORY RAG STORE (uses config.go settings)
+// ================================================================================
+
+// InMemoryRAG is a simple vector store for development/testing
 type InMemoryRAG struct {
-	documents []ragDocument
+	documents []storedDoc
 }
 
-type ragDocument struct {
-	Content   string
-	Source    string
-	SourceURL string
-	Embedding []float64
-	Category  string
+type storedDoc struct {
+	doc       RAGDocument
+	embedding []float64
 }
 
-// NewInMemoryRAG creates a new in-memory RAG store
+// NewInMemoryRAG creates an in-memory RAG store
 func NewInMemoryRAG() *InMemoryRAG {
 	return &InMemoryRAG{
-		documents: make([]ragDocument, 0),
+		documents: make([]storedDoc, 0),
 	}
 }
 
-// Add adds a document to the store with simple TF-IDF-style embedding
-func (r *InMemoryRAG) Add(content, source, sourceURL, category string) {
-	r.documents = append(r.documents, ragDocument{
-		Content:   content,
-		Source:    source,
-		SourceURL: sourceURL,
-		Embedding: simpleEmbed(content),
-		Category:  category,
-	})
+// Add stores a document with its embedding
+func (r *InMemoryRAG) Add(doc RAGDocument) {
+	emb := simpleEmbedding(doc.Content)
+	r.documents = append(r.documents, storedDoc{doc: doc, embedding: emb})
 }
 
-// Search finds the most relevant documents for a query
-func (r *InMemoryRAG) Search(ctx context.Context, query string, limit int) ([]RAGResult, error) {
-	if len(r.documents) == 0 {
-		return nil, nil
+// Search finds the top-K most similar documents (uses RAGTopK from config)
+func (r *InMemoryRAG) Search(ctx context.Context, query string, topK int) ([]RAGDocument, error) {
+	if topK <= 0 {
+		topK = RAGTopK // Use config default
 	}
 
-	queryEmbed := simpleEmbed(query)
+	queryEmb := simpleEmbedding(query)
 
 	type scored struct {
-		doc   ragDocument
-		score float64
+		doc        RAGDocument
+		similarity float64
 	}
 
-	var scores []scored
-	for _, doc := range r.documents {
-		score := cosineSimilarity(queryEmbed, doc.Embedding)
-		scores = append(scores, scored{doc: doc, score: score})
+	scores := make([]scored, 0, len(r.documents))
+	for _, sd := range r.documents {
+		sim := cosineSimilarity(queryEmb, sd.embedding)
+		if sim >= RAGMinSimilarity { // Use config threshold
+			sd.doc.Similarity = sim
+			scores = append(scores, scored{doc: sd.doc, similarity: sim})
+		}
 	}
 
 	sort.Slice(scores, func(i, j int) bool {
-		return scores[i].score > scores[j].score
+		return scores[i].similarity > scores[j].similarity
 	})
 
-	if limit > len(scores) {
-		limit = len(scores)
-	}
-
-	results := make([]RAGResult, limit)
-	for i := 0; i < limit; i++ {
-		results[i] = RAGResult{
-			Content:   scores[i].doc.Content,
-			Source:    scores[i].doc.Source,
-			SourceURL: scores[i].doc.SourceURL,
-			Score:     scores[i].score,
-		}
+	results := make([]RAGDocument, 0, topK)
+	for i := 0; i < len(scores) && i < topK; i++ {
+		results = append(results, scores[i].doc)
 	}
 
 	return results, nil
 }
 
-// simpleEmbed creates a simple bag-of-words embedding
-func simpleEmbed(text string) []float64 {
-	const dim = 256
-	embed := make([]float64, dim)
+// ================================================================================
+// EMBEDDING (simple TF-IDF style, uses RAGEmbeddingDim from config)
+// ================================================================================
 
+func simpleEmbedding(text string) []float64 {
 	words := strings.Fields(strings.ToLower(text))
+	emb := make([]float64, RAGEmbeddingDim)
+
 	for _, word := range words {
-		// Simple hash to dimension
-		h := hashString(word) % dim
-		embed[h] += 1.0
+		idx := hashWord(word) % RAGEmbeddingDim
+		emb[idx] += 1.0
+	}
+
+	// Add bigrams
+	for i := 0; i < len(words)-1; i++ {
+		bigram := words[i] + "_" + words[i+1]
+		idx := hashWord(bigram) % RAGEmbeddingDim
+		emb[idx] += 0.5
 	}
 
 	// Normalize
 	var mag float64
-	for _, v := range embed {
+	for _, v := range emb {
 		mag += v * v
 	}
-	mag = math.Sqrt(mag)
 	if mag > 0 {
-		for i := range embed {
-			embed[i] /= mag
+		mag = math.Sqrt(mag)
+		for i := range emb {
+			emb[i] /= mag
 		}
 	}
 
-	return embed
+	return emb
 }
 
-func hashString(s string) int {
-	h := 0
-	for _, c := range s {
-		h = 31*h + int(c)
+func hashWord(word string) int {
+	hash := 0
+	for _, c := range word {
+		hash = hash*31 + int(c)
 	}
-	if h < 0 {
-		h = -h
+	if hash < 0 {
+		hash = -hash
 	}
-	return h
+	return hash
 }
 
 func cosineSimilarity(a, b []float64) float64 {
