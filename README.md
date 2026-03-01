@@ -1,6 +1,6 @@
 # laozi
 Contrainted Reasoning LLM generic plugin- (vibe coded version)
-[README(1).md](https://github.com/user-attachments/files/25651682/README.1.md)
+[README.md](https://github.com/user-attachments/files/25651682/README.1.md)
 # Laozi Go Plugin
 
 **Dual-Constraint Insight Generation Engine**
