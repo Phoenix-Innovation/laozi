@@ -1,4 +1,7 @@
-# laozi
+<p align="center">
+    <img width="128" height="128" alt="laozi-dragon-tiger-logo" src="https://github.com/user-attachments/assets/77aa9bf9-76c3-4d76-b8a5-b4def4ba0fb0" /> </p>
+<h1 align="Center">Laozi</h1>
+
 Contrainted Reasoning LLM generic plugin- (vibe coded version)
 [README.md](https://github.com/user-attachments/files/25651682/README.1.md)
 # Laozi Go Plugin
