@@ -24,10 +24,7 @@ const (
 
 // RAG Configuration
 const (
-	RAGEnabled         = true                // Enable/disable RAG entirely
 	RAGTopK            = 3                   // Number of documents to retrieve
-	RAGMinSimilarity   = 0.7                 // Minimum cosine similarity threshold
-	RAGEmbeddingModel  = "text-embedding-3-small"
 	RAGEmbeddingDim    = 384                 // Embedding vector dimension
 )
 
@@ -36,8 +33,6 @@ const (
 	MaxRetries          = 2                  // Regeneration attempts on validation failure
 	MinInsightTextLen   = 20                 // Minimum insight text length
 	RequireReference    = true               // Insights must have source reference
-	RequireURL          = true               // References must contain URL
-	EnforceSeverityMatch = true              // Severity must match pre-computed expectation
 )
 
 // Logging Configuration
