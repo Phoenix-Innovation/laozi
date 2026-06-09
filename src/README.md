@@ -1,25 +1,36 @@
-# Laozi — Constrained-Reasoning Insight Engine
+# Laozi
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/Phoenix-Innovation/laozi.svg)](https://pkg.go.dev/github.com/Phoenix-Innovation/laozi)
+[![Go Tests](https://github.com/Phoenix-Innovation/laozi/actions/workflows/test.yml/badge.svg)](https://github.com/Phoenix-Innovation/laozi/actions/workflows/test.yml)
 
-> **The LLM has limited authority — a property of the system, not a hope about the prompt.**
+A dual-constraint enforcement engine for LLM-generated insights.
+The LLM has **limited authority** — that's a property of the system, not a hope about the prompt.
 
-Laozi is a Go library that generates LLM-powered insights while **guaranteeing**
-that structured fields (severity, citation, goal) reflect deterministic truth,
-not the model's claims. Every deviation the LLM produces is caught, corrected,
-and recorded in an audit trail.
+## How It Works
 
----
+Laozi sits between your LLM and the user. Every insight the LLM generates is
+run through deterministic enforcement that **cannot be bypassed by prompt
+injection**:
+
+1. **Severity enforcement** — if a metric is outside its threshold, the
+   severity is rewritten to match. The LLM cannot claim "success" when the
+   data says otherwise.
+2. **Citation enforcement** — references must use the pre-registered source
+   URL. Invented citations are replaced.
+3. **Numeric guardrails** — in strict mode, any number the LLM invents
+   (not present in the original data or thresholds) is rejected.
+4. **Retry loop** — if the LLM output fails validation (too short, contains
+   placeholders, unparseable), the engine retries with the error appended to
+   the prompt. Configurable via `Config.MaxRetries` (default 2).
+5. **Parallel analysis** — `Analyze()` processes categories concurrently,
+   bounded by `Config.MaxParallel` (default 4).
 
 ## Install
 
 ```bash
-go get github.com/Phoenix-Innovation/laozi@v0.2.0
+go get github.com/Phoenix-Innovation/laozi
 ```
 
-Requires **Go 1.21+**. Zero external dependencies.
-
----
+Requires Go 1.21+.
 
 ## Quick Start
 
@@ -29,215 +40,149 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
-
 	"github.com/Phoenix-Innovation/laozi"
 )
 
-// Implement laozi.LLMClient with your provider (OpenAI, Azure, local, etc.)
-type myLLM struct{ /* api key, http client, ... */ }
-
-func (m myLLM) Chat(ctx context.Context, system, user string) (string, error) {
-	// call your LLM here
-	return `{"insight":{"text":"...","severity":"success","reference":"..."}}`, nil
-}
-
 func main() {
-	engine := laozi.New(
-		laozi.WithLLM(myLLM{}),
-		// laozi.WithRAG(store),     // optional vector DB
-		// laozi.WithStrict(true),   // replace prose on number violations
+	// Bring your own LLM — any type that implements laozi.LLM.
+	var myLLM laozi.LLM // = your OpenAI / Anthropic / local wrapper
+
+	e := laozi.New(
+		laozi.WithLLM(myLLM),
+		laozi.WithStrict(true),
+		laozi.WithConfig(laozi.Config{
+			MaxRetries:  3,
+			MaxParallel: 8,
+			MinTextLen:  20,
+		}),
 	)
 
-	engine.AddCategory(laozi.Category{
-		ID:   "glucose",
-		Name: "Blood Glucose",
+	e.AddCategory(laozi.Category{
+		ID:   "liquidity",
+		Name: "Liquidity",
 		Thresholds: []laozi.Threshold{{
-			Metric:    "fasting_glucose",
-			Min:       70,
-			Max:       99,
-			Unit:      "mg/dL",
-			Source:    "ADA",
-			SourceURL: "https://diabetes.org/diagnosis",
+			Metric: "current_ratio",
+			Min:    1.5, Max: 3.0,
+			Unit:   "ratio",
+			Source: "CFA Institute",
+			SourceURL: "https://cfainstitute.org/liquidity",
 		}},
 	})
 
-	insights, err := engine.Analyze(context.Background(), map[string]float64{
-		"fasting_glucose": 112.0, // above max → severity enforced to "warning"
-	})
+	metrics := map[string]float64{"current_ratio": 1.2}
+	insights, err := e.Analyze(context.Background(), metrics)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
-
 	for _, ins := range insights {
-		fmt.Printf("Severity: %s (guaranteed)\n", ins.Severity)
-		fmt.Printf("Reference: %s (guaranteed)\n", ins.Reference)
-		for _, v := range ins.Violations {
-			fmt.Printf("  [%s] LLM said %q → enforced %q\n", v.Kind, v.LLMValue, v.Enforced)
-		}
+		fmt.Printf("%s: %s — %s\n", ins.CategoryID, ins.Severity, ins.Text)
+		// liquidity: warning — ... (severity enforced: 1.2 < 1.5)
 	}
 }
 ```
 
-A complete runnable example lives in
-[`example_test.go`](example_test.go) and runs as part of `go test`.
+## Core Types
 
----
+### LLM Interface
 
-## Enforcement Guarantees
+```go
+type LLM interface {
+	Chat(ctx context.Context, system, user string) (string, error)
+}
+```
 
-The enforcement layer runs **after** the LLM responds and **before** the result
-is returned. On any conflict, deterministic truth wins:
+Implement this with any provider. The engine calls `Chat` once per category
+(plus retries on validation failure).
 
-| Guarantee | Type | What happens |
+### Config
+
+```go
+type Config struct {
+	MaxRetries   int      // LLM retry attempts on validation failure (default 2)
+	MaxParallel  int      // concurrent category analyses (default 4)
+	MinTextLen   int      // minimum insight text length (0 = disabled)
+	Placeholders []string // substrings that invalidate output (default: [INSERT, [PLACEHOLDER, {{)
+}
+```
+
+Pass via `WithConfig(cfg)`. Zero values use defaults.
+
+### Category & Threshold
+
+```go
+type Category struct {
+	ID          string
+	Name        string
+	Thresholds  []Threshold
+	Educational bool       // no thresholds to enforce
+	Goals       []Goal     // target-based checks
+}
+
+type Threshold struct {
+	Metric    string
+	Min, Max  float64
+	Unit      string
+	Source    string
+	SourceURL string
+}
+```
+
+### Insight (output)
+
+```go
+type Insight struct {
+	CategoryID string
+	Text       string
+	Severity   Severity   // success | info | warning | danger
+	Reference  string
+	Violations []Violation
+}
+```
+
+`Violations` logs every enforcement action taken — severity corrections,
+citation replacements, numeric rejections. This is an audit trail, not an
+error list.
+
+## RAG Support
+
+```go
+e.AddRAGResults([]laozi.RAGResult{
+	{Content: "The current ratio...", Source: "Annual Report 2024"},
+})
+```
+
+RAG results are injected into the LLM prompt as grounding context.
+Enforcement still applies — RAG doesn't bypass constraints.
+
+## Adaptive Context
+
+```go
+e.SetContext("portfolio_size", "large-cap")
+e.SetContext("region", "APAC")
+```
+
+Key-value pairs appended to every prompt. Thread-safe (uses `sync.RWMutex`).
+
+## Enforcement Details
+
+| Check | Strict Mode | Lax Mode |
 |---|---|---|
-| **Severity** | Unconditional | `value < min` → `warning`, period. The LLM cannot override arithmetic. |
-| **Reference** | Unconditional | Built from `Threshold.Source` + `Threshold.SourceURL`. The model's citation is never trusted. |
-| **Suggested Goal** | Unconditional | Target/unit/comparison aligned to the relevant threshold bound. Unknown metrics are dropped. |
-| **Numbers in Prose** | Heuristic | Flags numbers not traceable to data or thresholds. In **strict mode**, replaces the entire narration. |
+| Severity vs thresholds | Enforced + violation logged | Enforced + violation logged |
+| Citation URL | Replaced with registered source | Replaced with registered source |
+| Invented numbers | **Rejected** (text rewritten) | Allowed |
+| Parse failure | Fallback to canned text | Fallback to canned text |
+| Validation failure | Retry up to MaxRetries, then fallback | Retry up to MaxRetries, then fallback |
 
-Every correction is recorded as a `Violation`:
-
-```go
-type Violation struct {
-    Kind     string // "severity" | "reference" | "goal" | "number" | "parse"
-    LLMValue string // what the model returned
-    Enforced string // what the engine used instead
-    Detail   string // human-readable explanation
-}
-```
-
-An empty `insight.Violations` slice means the LLM was fully compliant.
-
----
-
-## Pipeline
-
-```
-compute ground truth  →  call LLM  →  parse JSON  →  enforce 4 points  →  return Insight
-       (Go)               (you)        (Go)             (Go)                  ↑
-                                          ↓                              Violations attached
-                                    parse fails?
-                                    strict → deterministic fallback
-                                    lax    → error
-```
-
----
-
-## API Surface
-
-### Engine
-
-```go
-engine := laozi.New(opts ...Option)                              // construct
-engine.AddCategory(cat Category)                                 // register thresholds
-engine.AddCategories(cats []Category)                            // bulk register
-engine.Analyze(ctx, metrics map[string]float64) ([]Insight, error)  // all categories
-engine.AnalyzeCategory(ctx, id string, metrics) (*Insight, error)   // single category
-engine.SetContext(key string, value interface{})                  // goroutine-safe
-```
-
-### Options
-
-```go
-laozi.WithLLM(client LLMClient)              // required — your LLM adapter
-laozi.WithRAG(store RAGStore)                // optional — vector DB for Tier 2
-laozi.WithStrict(bool)                       // optional — replace prose on number violations
-laozi.WithContext(key string, value any)     // optional — domain context injected into prompts
-```
-
-### Interfaces you implement
-
-```go
-// LLMClient — the only required adapter. Wrap OpenAI, Azure, Ollama, etc.
-type LLMClient interface {
-    Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error)
-}
-
-// RAGStore — optional. Plug in pgvector, Pinecone, Weaviate, etc.
-type RAGStore interface {
-    Search(ctx context.Context, query string, limit int) ([]RAGResult, error)
-}
-```
-
-### Types
-
-| Type | Purpose |
-|---|---|
-| `Category` | Groups metrics, thresholds, and optional RAG query |
-| `Threshold` | Min/max bounds, unit, source, source URL for one metric |
-| `Insight` | Generated output — text, severity, reference, goal, violations |
-| `Violation` | One correction the engine made to the LLM's output |
-| `SuggestedGoal` | Actionable target (metric, value, comparison) |
-| `Severity` | `"warning"` / `"success"` / `"info"` |
-| `RAGResult` | Content + source from vector search |
-
----
-
-## Strict Mode
-
-```go
-engine := laozi.New(
-    laozi.WithLLM(client),
-    laozi.WithStrict(true),  // ← this
-)
-```
-
-In strict mode:
-- **Number violations** → LLM prose replaced with deterministic template
-- **Parse failures** → deterministic fallback instead of error
-- The LLM is cut out entirely the moment it steps out of line
-
----
-
-## Tests
+## Testing
 
 ```bash
-go test ./... -race -count=1 -v
+go test ./... -race
 ```
 
-**18 tests**, all passing with `-race`:
-
-| Test | What it proves |
-|---|---|
-| 14-row truth table | Every enforcement path: severity override, bogus citation, goal correction, number tracing, parse failure, strict fallback, educational, multi-metric |
-| `TestAnalyzeAllCategories` | Full pipeline with compliant mock → zero violations |
-| `TestAnalyzeEnforcesEveryCategory` | Enforcement runs on every category in `Analyze()` |
-| `TestAnalyzeParallelRace` | Concurrent `SetContext` + `Analyze` under `-race` |
-| `Example` | Runnable godoc example — compiles, executes, output verified |
-
----
-
-## Releasing
-
-```bash
-git tag -a v0.2.0 -m "v0.2.0: enforcement layer"
-git push origin v0.2.0
-```
-
-After pushing the tag, `pkg.go.dev` picks it up automatically.
-Consumers install with:
-
-```bash
-go get github.com/Phoenix-Innovation/laozi@v0.2.0
-```
-
----
-
-## File Layout
-
-```
-.
-├── go.mod                          # module github.com/Phoenix-Innovation/laozi
-├── laozi.go                        # all types, engine, pipeline, enforcement (746 lines)
-├── enforce.go                      # package declaration only (logic integrated into laozi.go)
-├── enforce_test.go                 # 14-row enforcement truth table
-├── enforce_concurrency_test.go     # race-condition + parallel tests
-├── example_test.go                 # runnable Example() for godoc
-└── README.md                       # this file
-```
-
----
+The test suite includes:
+- **14-row truth table** covering every severity × enforcement combination
+- **Concurrency tests** with `-race` (16 goroutines × 40 iterations)
+- **Runnable example** (`Example` function)
 
 ## License
 

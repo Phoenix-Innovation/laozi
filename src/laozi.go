@@ -11,28 +11,23 @@
 //
 // Usage:
 //
-//      var myLLM laozi.LLMClient = ... // any type implementing Chat(ctx, system, user string) (string, error)
+//      var client laozi.LLMClient // any type with Chat(ctx, system, user) (string, error)
 //
 //      engine := laozi.New(
-//              laozi.WithLLM(myLLM),
-//              laozi.WithRAG(myRAGStore), // optional
-//              laozi.WithStrict(true),    // optional: replace LLM prose on number violations
+//              laozi.WithLLM(client),
+//              laozi.WithConfig(laozi.Config{MaxRetries: 2, MaxParallel: 8}),
+//              laozi.WithStrict(true),
 //      )
 //
-//      // Define your domain thresholds
 //      engine.AddCategory(laozi.Category{
-//              ID:   "revenue",
-//              Name: "Revenue Analysis",
-//              Thresholds: []laozi.Threshold{
-//                      {Metric: "monthly_revenue", Min: 100000, Max: 500000, Unit: "USD",
-//                       Source: "Finance Team", SourceURL: "https://example.com/policy"},
-//              },
+//              ID: "glucose", Name: "Blood Glucose",
+//              Thresholds: []laozi.Threshold{{
+//                      Metric: "fasting_glucose", Min: 70, Max: 99, Unit: "mg/dL",
+//                      Source: "ADA", SourceURL: "https://diabetes.org/diagnosis",
+//              }},
 //      })
 //
-//      // Generate insights — every insight carries a Violations audit trail
-//      insights, err := engine.Analyze(ctx, map[string]float64{
-//              "monthly_revenue": 75000,
-//      })
+//      insights, err := engine.Analyze(ctx, map[string]float64{"fasting_glucose": 112})
 package laozi
 
 import (
@@ -50,7 +45,7 @@ import (
 // Core types
 // ---------------------------------------------------------------------------
 
-// Severity levels for insights
+// Severity levels for insights.
 type Severity string
 
 const (
@@ -59,7 +54,7 @@ const (
         SeverityInfo    Severity = "info"    // Educational/informational
 )
 
-// Threshold defines a constraint for a metric
+// Threshold defines a constraint for a metric.
 type Threshold struct {
         Metric      string  `json:"metric"`
         Min         float64 `json:"min"`
@@ -72,18 +67,18 @@ type Threshold struct {
         Description string  `json:"description,omitempty"`
 }
 
-// Category groups related metrics and thresholds
+// Category groups related metrics and thresholds.
 type Category struct {
         ID          string      `json:"id"`
         Name        string      `json:"name"`
         Thresholds  []Threshold `json:"thresholds"`
-        Educational bool        `json:"educational"` // If true, generates "Did You Know" tips
+        Educational bool        `json:"educational"`
         RAGQuery    string      `json:"rag_query,omitempty"`
 }
 
-// Insight is the output from analysis. The Violations slice is the audit trail:
-// it records every case where the LLM deviated from deterministic truth and
-// was corrected. An empty Violations slice means the LLM was fully compliant.
+// Insight is the output from analysis. The Violations slice is the audit
+// trail: it records every case where the LLM deviated from deterministic
+// truth and was corrected. An empty slice means the LLM was fully compliant.
 type Insight struct {
         ID             string            `json:"id"`
         CategoryID     string            `json:"category_id"`
@@ -97,7 +92,7 @@ type Insight struct {
         Metadata       map[string]string `json:"metadata,omitempty"`
 }
 
-// SuggestedGoal provides actionable targets
+// SuggestedGoal provides actionable targets.
 type SuggestedGoal struct {
         Metric      string  `json:"metric"`
         Target      float64 `json:"target"`
@@ -106,14 +101,12 @@ type SuggestedGoal struct {
         Description string  `json:"description"`
 }
 
-// Violation records one case where the LLM output disagreed with the
-// deterministic ground truth and was corrected. Attaching these to every
-// Insight is what makes the audit trail real: a caller (or auditor) can see
-// exactly what the model tried to do and what the engine enforced instead.
+// Violation records one case where the LLM output disagreed with
+// deterministic ground truth and was corrected.
 type Violation struct {
         Kind     string `json:"kind"`      // severity | reference | goal | number | parse
         LLMValue string `json:"llm_value"` // what the model returned
-        Enforced string `json:"enforced"`  // what the engine used instead (empty = flagged only)
+        Enforced string `json:"enforced"`  // what the engine used instead
         Detail   string `json:"detail"`
 }
 
@@ -121,12 +114,17 @@ type Violation struct {
 // Interfaces
 // ---------------------------------------------------------------------------
 
-// RAGStore interface for optional vector database integration
+// LLMClient is the only required adapter. Wrap OpenAI, Azure, Ollama, etc.
+type LLMClient interface {
+        Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+}
+
+// RAGStore is an optional vector database integration.
 type RAGStore interface {
         Search(ctx context.Context, query string, limit int) ([]RAGResult, error)
 }
 
-// RAGResult from vector search
+// RAGResult from vector search.
 type RAGResult struct {
         Content   string  `json:"content"`
         Source    string  `json:"source"`
@@ -134,28 +132,49 @@ type RAGResult struct {
         Score     float64 `json:"score"`
 }
 
-// LLMClient interface for LLM integration
-type LLMClient interface {
-        Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// Config holds tunable engine parameters. Zero values use sensible defaults.
+type Config struct {
+        MaxRetries   int      // LLM retry attempts on validation failure (default 2)
+        MaxParallel  int      // concurrent category analyses in Analyze (default 4)
+        MinTextLen   int      // minimum insight text length (0 = disabled)
+        Placeholders []string // substrings that invalidate LLM output
+}
+
+// defaults returns a Config with all zero-value fields replaced by defaults.
+func (c Config) defaults() Config {
+        if c.MaxRetries <= 0 {
+                c.MaxRetries = 2
+        }
+        if c.MaxParallel <= 0 {
+                c.MaxParallel = 4
+        }
+        // MinTextLen defaults to 0 (disabled); callers opt in via WithConfig.
+        if len(c.Placeholders) == 0 {
+                c.Placeholders = []string{"[INSERT", "[PLACEHOLDER", "{{"}
+        }
+        return c
 }
 
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 
-// Engine is the main Laozi insight generator. The strict field controls
-// whether LLM prose containing untraceable numbers is replaced with a
-// deterministic template (true) or merely flagged (false, default).
+// Engine is the main Laozi insight generator.
 type Engine struct {
         categories map[string]Category
         llm        LLMClient
-        rag        RAGStore // optional
+        rag        RAGStore
         context    map[string]interface{}
-        mu         sync.RWMutex // protects context map for concurrent access
+        mu         sync.RWMutex
         strict     bool
+        cfg        Config
 }
 
-// New creates a new Laozi engine
+// New creates a new Laozi engine.
 func New(opts ...Option) *Engine {
         e := &Engine{
                 categories: make(map[string]Category),
@@ -164,46 +183,45 @@ func New(opts ...Option) *Engine {
         for _, opt := range opts {
                 opt(e)
         }
+        e.cfg = e.cfg.defaults()
         return e
 }
 
-// Option configures the engine
+// Option configures the engine.
 type Option func(*Engine)
 
-// WithLLM sets the LLM client
+// WithLLM sets the LLM client.
 func WithLLM(client LLMClient) Option {
         return func(e *Engine) { e.llm = client }
 }
 
-// WithRAG enables optional RAG support
+// WithRAG enables optional RAG support.
 func WithRAG(store RAGStore) Option {
         return func(e *Engine) { e.rag = store }
 }
 
-// WithStrict controls what happens when the LLM's narrative prose contains
-// numbers that can't be traced to the input data or thresholds.
-//
-//   - false (default): such cases are recorded as Violations but the LLM text
-//     is kept.
-//   - true: the narration is discarded and replaced with a deterministic,
-//     number-correct template. In strict mode the LLM is cut out entirely the
-//     moment it steps out of line — this is what makes "the LLM has limited
-//     authority" a property of the system rather than a hope about the prompt.
+// WithStrict enables strict enforcement: LLM prose containing untraceable
+// numbers is replaced with a deterministic template.
 func WithStrict(strict bool) Option {
         return func(e *Engine) { e.strict = strict }
 }
 
-// WithContext adds domain context (e.g., user profile, entity info)
+// WithConfig sets engine configuration (retries, parallelism, validation).
+func WithConfig(cfg Config) Option {
+        return func(e *Engine) { e.cfg = cfg }
+}
+
+// WithContext adds domain context injected into LLM prompts.
 func WithContext(key string, value interface{}) Option {
         return func(e *Engine) { e.context[key] = value }
 }
 
-// AddCategory registers a category with its thresholds
+// AddCategory registers a category with its thresholds.
 func (e *Engine) AddCategory(cat Category) {
         e.categories[cat.ID] = cat
 }
 
-// AddCategories registers multiple categories
+// AddCategories registers multiple categories.
 func (e *Engine) AddCategories(cats []Category) {
         for _, cat := range cats {
                 e.categories[cat.ID] = cat
@@ -217,8 +235,6 @@ func (e *Engine) SetContext(key string, value interface{}) {
         e.mu.Unlock()
 }
 
-// snapshotContext returns a shallow copy of the context map for safe
-// concurrent reading (e.g., JSON marshalling in prompt construction).
 func (e *Engine) snapshotContext() map[string]interface{} {
         e.mu.RLock()
         defer e.mu.RUnlock()
@@ -233,24 +249,49 @@ func (e *Engine) snapshotContext() map[string]interface{} {
 // Public analysis API
 // ---------------------------------------------------------------------------
 
-// Analyze generates insights for the given metrics across all categories.
+// Analyze generates insights for all registered categories in parallel,
+// bounded by Config.MaxParallel goroutines.
 func (e *Engine) Analyze(ctx context.Context, metrics map[string]float64) ([]Insight, error) {
         if e.llm == nil {
                 return nil, fmt.Errorf("LLM client not configured")
         }
 
-        var insights []Insight
-
-        for _, cat := range e.categories {
-                insight, err := e.analyzeCategory(ctx, cat, metrics)
-                if err != nil {
-                        return nil, fmt.Errorf("category %s: %w", cat.ID, err)
-                }
-                if insight != nil {
-                        insights = append(insights, *insight)
-                }
+        type result struct {
+                insight *Insight
+                err     error
         }
 
+        cats := make([]Category, 0, len(e.categories))
+        for _, cat := range e.categories {
+                cats = append(cats, cat)
+        }
+
+        results := make([]result, len(cats))
+        sem := make(chan struct{}, e.cfg.MaxParallel)
+        var wg sync.WaitGroup
+
+        for i, cat := range cats {
+                wg.Add(1)
+                go func(i int, cat Category) {
+                        defer wg.Done()
+                        sem <- struct{}{}        // acquire
+                        defer func() { <-sem }() // release
+
+                        ins, err := e.analyzeCategory(ctx, cat, metrics)
+                        results[i] = result{ins, err}
+                }(i, cat)
+        }
+        wg.Wait()
+
+        var insights []Insight
+        for _, r := range results {
+                if r.err != nil {
+                        return nil, r.err
+                }
+                if r.insight != nil {
+                        insights = append(insights, *r.insight)
+                }
+        }
         return insights, nil
 }
 
@@ -264,17 +305,15 @@ func (e *Engine) AnalyzeCategory(ctx context.Context, categoryID string, metrics
 }
 
 // ---------------------------------------------------------------------------
-// Core pipeline: compute → LLM → enforce
+// Core pipeline: compute → LLM → parse → enforce → validate → retry
 // ---------------------------------------------------------------------------
 
 func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
-        // Step 1: Deterministic ground truth — computed entirely in Go.
+        // Step 1: Deterministic ground truth.
         comp := computeAnalysis(cat, metrics)
 
-        // Build threshold guidelines text (for the LLM prompt)
         guidelinesText := e.buildGuidelinesText(cat)
 
-        // Get RAG context if available
         var ragContext string
         if e.rag != nil && cat.RAGQuery != "" {
                 results, err := e.rag.Search(ctx, cat.RAGQuery, 2)
@@ -283,51 +322,84 @@ func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[
                 }
         }
 
-        // Build prompts — the prompt includes the EXPECTED SEVERITY so a
-        // compliant LLM can echo it, but enforcement doesn't depend on that.
         systemPrompt := e.buildSystemPrompt()
         userPrompt := e.buildUserPrompt(cat, guidelinesText, comp.metricsText, ragContext, comp.severity)
 
-        // Step 2: Call LLM
-        response, err := e.llm.Chat(ctx, systemPrompt, userPrompt)
-        if err != nil {
-                return nil, fmt.Errorf("LLM call failed: %w", err)
-        }
-
-        // Step 3: Parse response
-        insight, parseErr := e.parseResponse(response, cat)
-
-        if parseErr != nil {
-                // In strict mode, parse failure is recoverable: fall back to
-                // deterministic template. In lax mode, it's a hard error.
-                if e.strict {
-                        insight = e.buildFallbackInsight(cat, comp)
-                        insight.Violations = append(insight.Violations, Violation{
-                                Kind:     "parse",
-                                LLMValue: truncate(response, 200),
-                                Enforced: "deterministic template used",
-                                Detail:   fmt.Sprintf("LLM response could not be parsed: %v", parseErr),
-                        })
-                        return insight, nil
+        // Step 2+: LLM → parse → enforce → validate, with retries.
+        var lastErr error
+        for attempt := 0; attempt <= e.cfg.MaxRetries; attempt++ {
+                prompt := userPrompt
+                if attempt > 0 && lastErr != nil {
+                        // On retry, append the validation error so the LLM can correct.
+                        prompt = fmt.Sprintf("%s\n\nPREVIOUS ATTEMPT FAILED VALIDATION: %s\nPlease fix and try again.",
+                                userPrompt, lastErr)
                 }
-                return nil, parseErr
+
+                response, err := e.llm.Chat(ctx, systemPrompt, prompt)
+                if err != nil {
+                        if e.strict {
+                                // LLM failure in strict mode → deterministic fallback.
+                                return e.buildFallbackInsight(cat, comp), nil
+                        }
+                        return nil, fmt.Errorf("LLM call failed: %w", err)
+                }
+
+                insight, parseErr := e.parseResponse(response, cat)
+                if parseErr != nil {
+                        if e.strict {
+                                ins := e.buildFallbackInsight(cat, comp)
+                                ins.Violations = append(ins.Violations, Violation{
+                                        Kind: "parse", LLMValue: truncate(response, 200),
+                                        Enforced: "deterministic template used",
+                                        Detail:   fmt.Sprintf("LLM response could not be parsed: %v", parseErr),
+                                })
+                                return ins, nil
+                        }
+                        lastErr = parseErr
+                        continue // retry
+                }
+
+                // Enforce — reconcile against ground truth.
+                e.enforce(insight, cat, comp)
+
+                // Validate — structural checks.
+                if valErr := e.validate(insight); valErr != nil {
+                        lastErr = valErr
+                        continue // retry
+                }
+
+                return insight, nil
         }
 
-        // Step 4: Enforce — reconcile LLM output against deterministic truth.
-        // After this call, severity, reference, and goal are GUARANTEED correct.
-        e.enforce(insight, cat, comp)
-
-        return insight, nil
+        // All retries exhausted.
+        if e.strict {
+                return e.buildFallbackInsight(cat, comp), nil
+        }
+        if lastErr != nil {
+                return nil, fmt.Errorf("validation failed after %d attempts: %w", e.cfg.MaxRetries+1, lastErr)
+        }
+        return nil, fmt.Errorf("analysis failed for category %s", cat.ID)
 }
 
-// buildFallbackInsight creates a fully deterministic insight when the LLM
-// output cannot be parsed (strict mode only).
+// validate checks structural properties of the insight text.
+func (e *Engine) validate(insight *Insight) error {
+        if e.cfg.MinTextLen > 0 && len(insight.Text) < e.cfg.MinTextLen {
+                return fmt.Errorf("text too short: %d < %d", len(insight.Text), e.cfg.MinTextLen)
+        }
+        for _, ph := range e.cfg.Placeholders {
+                if strings.Contains(insight.Text, ph) {
+                        return fmt.Errorf("contains placeholder: %s", ph)
+                }
+        }
+        return nil
+}
+
+// buildFallbackInsight creates a fully deterministic insight.
 func (e *Engine) buildFallbackInsight(cat Category, c computedAnalysis) *Insight {
         var relatedMetrics []string
         for _, t := range cat.Thresholds {
                 relatedMetrics = append(relatedMetrics, t.Metric)
         }
-
         return &Insight{
                 ID:             fmt.Sprintf("%s-001", cat.ID),
                 CategoryID:     cat.ID,
@@ -343,15 +415,12 @@ func (e *Engine) buildFallbackInsight(cat Category, c computedAnalysis) *Insight
 // Deterministic ground truth computation
 // ---------------------------------------------------------------------------
 
-// computedAnalysis is the deterministic ground truth for one category + metric
-// set. Everything here is computed in Go, before and independently of the LLM.
-// On any conflict, these values win.
 type computedAnalysis struct {
         severity    Severity
-        metricsText string       // human-readable comparison block for the prompt
-        reference   string       // canonical citation built from threshold metadata
-        lines       []metricLine // per-metric facts, for the template fallback
-        allowed     []float64    // numbers the LLM is permitted to state in prose
+        metricsText string
+        reference   string
+        lines       []metricLine
+        allowed     []float64
 }
 
 type metricLine struct {
@@ -363,8 +432,6 @@ type metricLine struct {
         status string // "BELOW minimum" | "WITHIN range" | "ABOVE maximum"
 }
 
-// computeAnalysis is the deterministic core. It produces prompt text and
-// captures the structured ground truth used for enforcement.
 func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis {
         c := computedAnalysis{severity: SeveritySuccess}
         var sb strings.Builder
@@ -372,7 +439,6 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
         var refs []string
 
         for _, t := range cat.Thresholds {
-                // Collect canonical references regardless of whether the metric is present.
                 if t.SourceURL != "" {
                         key := t.Source + "|" + t.SourceURL
                         if !seenRef[key] {
@@ -426,10 +492,6 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
 // Post-LLM enforcement
 // ---------------------------------------------------------------------------
 
-// enforce reconciles an LLM-produced Insight against the deterministic ground
-// truth, mutating it in place and recording every correction. After this runs,
-// severity, reference, and the suggested goal are GUARANTEED to reflect the
-// computed truth, not the model's claims.
 func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis) {
         // 1. Severity — deterministic always wins.
         if insight.Severity != c.severity {
@@ -441,8 +503,7 @@ func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis) {
                 insight.Severity = c.severity
         }
 
-        // 2. Reference — built from threshold metadata; the model's is never trusted.
-        //    Only enforce when the category actually declares source URLs.
+        // 2. Reference — built from threshold metadata; never trust the model.
         if c.reference != "" {
                 if !referenceMatches(insight.Reference, cat) {
                         insight.Violations = append(insight.Violations, Violation{
@@ -454,14 +515,14 @@ func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis) {
                 insight.Reference = c.reference
         }
 
-        // 3. Suggested goal — target/unit/metric must come from a real threshold.
+        // 3. Suggested goal — must come from a real threshold.
         if insight.SuggestedGoal != nil {
                 if v := enforceGoal(insight.SuggestedGoal, cat, c); v != nil {
                         insight.Violations = append(insight.Violations, *v)
                 }
         }
 
-        // 4. Numbers in prose — best-effort trace check.
+        // 4. Numbers in prose — heuristic trace check.
         if bad := c.unknownNumbers(insight.Text); len(bad) > 0 {
                 v := Violation{
                         Kind: "number", LLMValue: strings.Join(bad, ", "),
@@ -494,12 +555,11 @@ func enforceGoal(g *SuggestedGoal, cat Category, c computedAnalysis) *Violation 
         }
         if th == nil {
                 orig := fmt.Sprintf("%+v", *g)
-                *g = SuggestedGoal{} // neutralize a goal we can't defend
+                *g = SuggestedGoal{}
                 return &Violation{Kind: "goal", LLMValue: orig,
                         Detail: "suggested goal referenced an unknown metric; dropped"}
         }
 
-        // The only defensible targets are the threshold bounds.
         target, cmp := th.Min, "gte"
         for _, line := range c.lines {
                 if line.metric == g.Metric && line.status == "ABOVE maximum" {
@@ -517,9 +577,6 @@ func enforceGoal(g *SuggestedGoal, cat Category, c computedAnalysis) *Violation 
         return nil
 }
 
-// renderText is the deterministic narration used as a fallback in strict mode
-// (and when the LLM returns unparseable output). Blander than the model's
-// prose, but every number is correct by construction.
 func (c computedAnalysis) renderText() string {
         var sb strings.Builder
         for _, l := range c.lines {
@@ -542,20 +599,17 @@ func (c computedAnalysis) renderText() string {
 }
 
 // ---------------------------------------------------------------------------
-// Number tracing in prose (heuristic)
+// Number tracing (heuristic)
 // ---------------------------------------------------------------------------
 
 var numRe = regexp.MustCompile(`-?[\d,]+(?:\.\d+)?`)
 
-// unknownNumbers returns numeric tokens in text that don't correspond to any
-// known quantity (actual values or threshold bounds).
+// unknownNumbers returns numeric tokens not traceable to data or thresholds.
 //
 // HONEST CAVEAT: this is heuristic. Free prose legitimately contains numbers
-// that aren't metrics ("over the last 30 days", "top 3 vendors"), so it will
-// produce false positives and is a *flagging* signal, not a hard guarantee.
-// The fully reliable guarantees in this file are severity, reference, and goal
-// — those are structured and enforced unconditionally. For prose, the real
-// lever is strict mode, which discards the model's text in favor of renderText.
+// that aren't metrics ("over the last 30 days"), so it can produce false
+// positives. Severity, reference, and goal are the hard guarantees. For prose,
+// the real lever is strict mode.
 func (c computedAnalysis) unknownNumbers(text string) []string {
         var bad []string
         for _, tok := range numRe.FindAllString(text, -1) {
@@ -588,7 +642,6 @@ func floatEq(a, b float64) bool {
         return math.Abs(a-b) <= tol
 }
 
-// truncate cuts a string to maxLen, appending "..." if truncated.
 func truncate(s string, maxLen int) string {
         if len(s) <= maxLen {
                 return s
@@ -640,7 +693,7 @@ RULES:
 
 SEVERITY:
 - "warning" = value OUTSIDE the threshold range
-- "success" = value WITHIN the threshold range  
+- "success" = value WITHIN the threshold range
 - "info" = educational tip (for educational categories)
 
 Respond with ONLY valid JSON.`
@@ -711,7 +764,6 @@ OUTPUT (use severity="%s"):
 // ---------------------------------------------------------------------------
 
 func (e *Engine) parseResponse(response string, cat Category) (*Insight, error) {
-        // Clean JSON markers
         response = strings.TrimPrefix(response, "```json")
         response = strings.TrimPrefix(response, "```")
         response = strings.TrimSuffix(response, "```")
@@ -730,7 +782,6 @@ func (e *Engine) parseResponse(response string, cat Category) (*Insight, error) 
                 return nil, fmt.Errorf("parse error: %w", err)
         }
 
-        // Extract related metrics
         var relatedMetrics []string
         for _, t := range cat.Thresholds {
                 relatedMetrics = append(relatedMetrics, t.Metric)
