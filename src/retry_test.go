@@ -176,10 +176,12 @@ func TestRetryPromptContainsPreviousError(t *testing.T) {
         }
         // Second prompt should contain the validation error from first attempt.
         if !strings.Contains(prompts[1], "PREVIOUS ATTEMPT FAILED VALIDATION") {
-                t.Errorf("retry prompt should reference previous failure, got: %s", prompts[1][:min(200, len(prompts[1]))])
+                trunc := prompts[1]; if len(trunc) > 200 { trunc = trunc[:200] }
+                t.Errorf("retry prompt should reference previous failure, got: %s", trunc)
         }
         if !strings.Contains(prompts[1], "placeholder") {
-                t.Errorf("retry prompt should contain the specific error, got: %s", prompts[1][:min(200, len(prompts[1]))])
+                trunc := prompts[1]; if len(trunc) > 200 { trunc = trunc[:200] }
+                t.Errorf("retry prompt should contain the specific error, got: %s", trunc)
         }
 }
 

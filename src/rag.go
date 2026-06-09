@@ -8,51 +8,94 @@ import (
 )
 
 // ================================================================================
-// IN-MEMORY RAG STORE (uses config.go settings)
+// IN-MEMORY RAG STORE
+// Compatible with RAGStore interface from laozi.go (returns []RAGResult).
+// Suitable for development/testing; swap with a real vector DB in production.
 // ================================================================================
 
-// InMemoryRAG is a simple vector store for development/testing
+// Default RAG constants (used when no Config override is supplied).
+const (
+	defaultRAGTopK         = 3
+	defaultRAGMinSimilarity = 0.7
+	defaultRAGEmbeddingDim  = 384
+)
+
+// InMemoryRAG is a simple in-memory vector store for development/testing.
 type InMemoryRAG struct {
-	documents []storedDoc
+	documents    []storedDoc
+	topK         int
+	minSimilarity float64
+	embeddingDim  int
 }
 
 type storedDoc struct {
-	doc       RAGDocument
+	result    RAGResult
 	embedding []float64
 }
 
-// NewInMemoryRAG creates an in-memory RAG store
-func NewInMemoryRAG() *InMemoryRAG {
-	return &InMemoryRAG{
-		documents: make([]storedDoc, 0),
+// RAGOption configures an InMemoryRAG instance.
+type RAGOption func(*InMemoryRAG)
+
+// WithRAGTopK overrides the default number of results returned by Search.
+func WithRAGTopK(k int) RAGOption {
+	return func(r *InMemoryRAG) { r.topK = k }
+}
+
+// WithRAGMinSimilarity sets the minimum cosine-similarity threshold.
+func WithRAGMinSimilarity(s float64) RAGOption {
+	return func(r *InMemoryRAG) { r.minSimilarity = s }
+}
+
+// WithRAGEmbeddingDim sets the embedding vector dimension.
+func WithRAGEmbeddingDim(d int) RAGOption {
+	return func(r *InMemoryRAG) { r.embeddingDim = d }
+}
+
+// NewInMemoryRAG creates an in-memory RAG store.
+// It satisfies the RAGStore interface declared in laozi.go.
+func NewInMemoryRAG(opts ...RAGOption) *InMemoryRAG {
+	r := &InMemoryRAG{
+		documents:    make([]storedDoc, 0),
+		topK:         defaultRAGTopK,
+		minSimilarity: defaultRAGMinSimilarity,
+		embeddingDim:  defaultRAGEmbeddingDim,
 	}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
-// Add stores a document with its embedding
-func (r *InMemoryRAG) Add(doc RAGDocument) {
-	emb := simpleEmbedding(doc.Content)
-	r.documents = append(r.documents, storedDoc{doc: doc, embedding: emb})
+// Add stores a document with its embedding.
+// The caller builds a RAGResult; the Score field is ignored on input
+// (it is populated at search time).
+func (r *InMemoryRAG) Add(doc RAGResult) {
+	emb := simpleEmbedding(doc.Content, r.embeddingDim)
+	r.documents = append(r.documents, storedDoc{result: doc, embedding: emb})
 }
 
-// Search finds the top-K most similar documents (uses RAGTopK from config)
-func (r *InMemoryRAG) Search(ctx context.Context, query string, topK int) ([]RAGDocument, error) {
+// Search finds the top-K most similar documents by cosine similarity.
+// It satisfies RAGStore.Search(ctx, query, limit) ([]RAGResult, error).
+func (r *InMemoryRAG) Search(ctx context.Context, query string, limit int) ([]RAGResult, error) {
+	topK := limit
 	if topK <= 0 {
-		topK = RAGTopK // Use config default
+		topK = r.topK
 	}
 
-	queryEmb := simpleEmbedding(query)
+	queryEmb := simpleEmbedding(query, r.embeddingDim)
 
 	type scored struct {
-		doc        RAGDocument
+		result     RAGResult
 		similarity float64
 	}
 
 	scores := make([]scored, 0, len(r.documents))
 	for _, sd := range r.documents {
 		sim := cosineSimilarity(queryEmb, sd.embedding)
-		if sim >= RAGMinSimilarity { // Use config threshold
-			sd.doc.Similarity = sim
-			scores = append(scores, scored{doc: sd.doc, similarity: sim})
+		if sim >= r.minSimilarity {
+			res := sd.result
+			res.Score = sim
+			scores = append(scores, scored{result: res, similarity: sim})
 		}
 	}
 
@@ -60,31 +103,31 @@ func (r *InMemoryRAG) Search(ctx context.Context, query string, topK int) ([]RAG
 		return scores[i].similarity > scores[j].similarity
 	})
 
-	results := make([]RAGDocument, 0, topK)
+	results := make([]RAGResult, 0, topK)
 	for i := 0; i < len(scores) && i < topK; i++ {
-		results = append(results, scores[i].doc)
+		results = append(results, scores[i].result)
 	}
 
 	return results, nil
 }
 
 // ================================================================================
-// EMBEDDING (simple TF-IDF style, uses RAGEmbeddingDim from config)
+// EMBEDDING (simple TF-IDF style with bigrams)
 // ================================================================================
 
-func simpleEmbedding(text string) []float64 {
+func simpleEmbedding(text string, dim int) []float64 {
 	words := strings.Fields(strings.ToLower(text))
-	emb := make([]float64, RAGEmbeddingDim)
+	emb := make([]float64, dim)
 
 	for _, word := range words {
-		idx := hashWord(word) % RAGEmbeddingDim
+		idx := hashWord(word) % dim
 		emb[idx] += 1.0
 	}
 
-	// Add bigrams
+	// Add bigrams for better context capture
 	for i := 0; i < len(words)-1; i++ {
 		bigram := words[i] + "_" + words[i+1]
-		idx := hashWord(bigram) % RAGEmbeddingDim
+		idx := hashWord(bigram) % dim
 		emb[idx] += 0.5
 	}
 
