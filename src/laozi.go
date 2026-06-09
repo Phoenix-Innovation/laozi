@@ -142,6 +142,7 @@ type Config struct {
         MaxParallel  int      // concurrent category analyses in Analyze (default 4)
         MinTextLen   int      // minimum insight text length (0 = disabled)
         Placeholders []string // substrings that invalidate LLM output
+        RAGTopK      int      // max results to retrieve per RAG search (default 3)
 }
 
 // defaults returns a Config with all zero-value fields replaced by defaults.
@@ -151,6 +152,9 @@ func (c Config) defaults() Config {
         }
         if c.MaxParallel <= 0 {
                 c.MaxParallel = 4
+        }
+        if c.RAGTopK <= 0 {
+                c.RAGTopK = 3
         }
         // MinTextLen defaults to 0 (disabled); callers opt in via WithConfig.
         if len(c.Placeholders) == 0 {
@@ -315,10 +319,12 @@ func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[
         guidelinesText := e.buildGuidelinesText(cat)
 
         var ragContext string
+        var ragResults []RAGResult
         if e.rag != nil && cat.RAGQuery != "" {
-                results, err := e.rag.Search(ctx, cat.RAGQuery, 2)
-                if err == nil && len(results) > 0 {
-                        ragContext = e.buildRAGContext(results)
+                var err error
+                ragResults, err = e.rag.Search(ctx, cat.RAGQuery, e.cfg.RAGTopK)
+                if err == nil && len(ragResults) > 0 {
+                        ragContext = e.buildRAGContext(ragResults)
                 }
         }
 
@@ -360,7 +366,7 @@ func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[
                 }
 
                 // Enforce — reconcile against ground truth.
-                e.enforce(insight, cat, comp)
+			e.enforce(insight, cat, comp, ragResults)
 
                 // Validate — structural checks.
                 if valErr := e.validate(insight); valErr != nil {
@@ -492,7 +498,7 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
 // Post-LLM enforcement
 // ---------------------------------------------------------------------------
 
-func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis) {
+func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis, ragResults []RAGResult) {
         // 1. Severity — deterministic always wins.
         if insight.Severity != c.severity {
                 insight.Violations = append(insight.Violations, Violation{
@@ -503,16 +509,33 @@ func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis) {
                 insight.Severity = c.severity
         }
 
-        // 2. Reference — built from threshold metadata; never trust the model.
-        if c.reference != "" {
-                if !referenceMatches(insight.Reference, cat) {
+        // 2. Reference — built from threshold metadata plus RAG sources.
+        //    Append RAG source URLs to the canonical reference so the LLM
+        //    can legitimately cite them.
+        fullRef := c.reference
+        if len(ragResults) > 0 {
+                for _, r := range ragResults {
+                        if r.SourceURL != "" {
+                                entry := r.Source + " - " + r.SourceURL
+                                if !strings.Contains(fullRef, r.SourceURL) {
+                                        if fullRef != "" {
+                                                fullRef += "; "
+                                        }
+                                        fullRef += entry
+                                }
+                        }
+                }
+        }
+
+        if fullRef != "" {
+                if !referenceMatches(insight.Reference, cat, ragResults) {
                         insight.Violations = append(insight.Violations, Violation{
                                 Kind: "reference", LLMValue: insight.Reference,
-                                Enforced: c.reference,
+                                Enforced: fullRef,
                                 Detail:   "citation did not match any provided source URL; replaced",
                         })
                 }
-                insight.Reference = c.reference
+                insight.Reference = fullRef
         }
 
         // 3. Suggested goal — must come from a real threshold.
@@ -536,9 +559,14 @@ func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis) {
         }
 }
 
-func referenceMatches(ref string, cat Category) bool {
+func referenceMatches(ref string, cat Category, ragResults []RAGResult) bool {
         for _, t := range cat.Thresholds {
                 if t.SourceURL != "" && strings.Contains(ref, t.SourceURL) {
+                        return true
+                }
+        }
+        for _, r := range ragResults {
+                if r.SourceURL != "" && strings.Contains(ref, r.SourceURL) {
                         return true
                 }
         }
