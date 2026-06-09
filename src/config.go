@@ -1,111 +1,124 @@
 package laozi
 
+import "time"
+
 // ================================================================================
-// BUILD-TIME CONFIGURATION
-// All settings here are compiled into the binary. No runtime configuration.
+// SOURCE OF TRUTH CONFIGURATION
+// Every build-time default lives here. Other files read these values instead of
+// hardcoding their own, so changing a setting here changes it everywhere.
+// Runtime overrides are layered on top: DefaultLLMOption helpers for the client,
+// RAGOption helpers for the in-memory store, and WithConfig for the engine — each
+// falls back to the constants below when not set.
 // ================================================================================
 
-// LLM Configuration
+// LLM configuration. Consumed by NewDefaultLLMClient (llm.go).
 const (
-	// Model settings
-	LLMModel       = "gpt-4o-mini"           // or "claude-3-sonnet", custom model name
+	LLMModel       = "gpt-4o-mini" // model name; override per-client with WithModel
 	LLMEndpoint    = "https://api.openai.com/v1/chat/completions"
-	LLMAPIKey      = ""                      // Set via environment: LAOZI_API_KEY
-	
-	// Generation parameters
-	LLMTemperature = 0.3                     // Lower = more deterministic
-	LLMMaxTokens   = 500                     // Max tokens per insight
-	LLMTopP        = 0.9                     // Nucleus sampling
-	
-	// Parallelism
-	MaxParallelLLMCalls = 35                 // Concurrent LLM requests
-	LLMTimeoutSeconds   = 30                 // Per-request timeout
+	LLMAPIKey      = ""  // fallback only; prefer the LAOZI_API_KEY env var
+	LLMTemperature = 0.3 // lower = more deterministic
+	LLMMaxTokens   = 500 // max tokens per insight
+	LLMTopP        = 0.9 // nucleus sampling
 )
 
-// RAG Configuration
+// LLMTimeout is the per-request HTTP timeout for the default client.
+const LLMTimeout = 30 * time.Second
+
+// MaxParallelLLMCalls is the default ceiling on concurrent category analyses.
+// Consumed by Config.defaults (laozi.go) as the MaxParallel default.
+const MaxParallelLLMCalls = 35
+
+// RAG configuration. Consumed by NewInMemoryRAG (rag.go) and Config.defaults.
+//
+// NOTE: RAGMinSimilarity is intentionally low because the bundled simpleEmbedding
+// is a bag-of-words hash — cosine similarities between short texts rarely exceed
+// ~0.3, so a 0.7 cutoff effectively disables retrieval. Swap in a real embedding
+// model (e.g. text-embedding-3-small) and raise this to 0.5+ for production.
 const (
-	RAGTopK            = 3                   // Number of documents to retrieve
-	RAGEmbeddingDim    = 384                 // Embedding vector dimension
+	RAGTopK          = 3
+	RAGEmbeddingDim  = 384
+	RAGMinSimilarity = 0.15
 )
 
-// Validation Configuration
+// Validation configuration. Consumed by Config.defaults and validate (laozi.go).
 const (
-	MaxRetries          = 2                  // Regeneration attempts on validation failure
-	MinInsightTextLen   = 20                 // Minimum insight text length
-	RequireReference    = true               // Insights must have source reference
+	MaxRetries        = 2  // regeneration attempts on validation failure
+	MinInsightTextLen = 20 // minimum insight text length
+	RequireReference  = true
 )
 
-// Logging Configuration
-const (
-	LogEnabled    = true                     // Enable pipeline logging
-	LogLevel      = "info"                   // "debug", "info", "warn", "error"
-	LogTimestamps = true                     // Include timestamps in logs
-)
-
-// Placeholder strings that indicate invalid LLM output
+// InvalidPlaceholders are substrings that, if present in LLM output text,
+// indicate an unfilled template and fail validation. Consumed by Config.defaults.
 var InvalidPlaceholders = []string{
-	"[VALUE]",
-	"[METRIC]",
-	"[TARGET]",
-	"[UNIT]",
-	"[Source]",
-	"[URL]",
-	"{{VALUE}}",
-	"{{METRIC}}",
+	"[INSERT", "[PLACEHOLDER", "{{",
+	"[VALUE]", "[METRIC]", "[TARGET]", "[UNIT]", "[Source]", "[URL]",
 }
 
-// Valid severity values
-var ValidSeverities = []Severity{
-	SeverityWarning,
-	SeveritySuccess,
-	SeverityInfo,
-}
+// ValidSeverities is the set of severities an LLM response may declare.
+// Consumed by parseResponse (laozi.go).
+var ValidSeverities = []Severity{SeverityWarning, SeveritySuccess, SeverityInfo}
 
 // ================================================================================
-// PROMPT TEMPLATES (compiled into binary)
+// PROMPT TEMPLATES (text/template syntax; rendered in laozi.go)
 // ================================================================================
 
-const SystemPromptTemplate = `You are a precise analytical engine. You MUST generate exactly ONE insight.
+const SystemPromptTemplate = `You are an insight generator using the Laozi dual-constraint system.
+You MUST generate exactly ONE insight based on the provided thresholds and data.
 
 RULES:
-1. Use ONLY the provided GUIDELINES and VALUES - no external knowledge
-2. The severity is PRE-COMPUTED - use the REQUIRED SEVERITY exactly
-3. Reference must include source name AND URL from the guidelines
-4. Never use placeholders like [VALUE] or [METRIC]
+1. Use ONLY the thresholds and references provided
+2. Never invent data or thresholds
+3. Compare actual values to thresholds explicitly
+4. Include the source URL in your reference
+5. Use ONLY numbers from the provided data and thresholds in your narrative
 
-OUTPUT FORMAT:
-{"insight": {"text": "...", "severity": "...", "reference": "Source - URL"}}`
+SEVERITY:
+- "warning" = value OUTSIDE the threshold range
+- "success" = value WITHIN the threshold range
+- "info" = educational tip (for educational categories)
+
+Respond with ONLY valid JSON.`
 
 const MetricPromptTemplate = `CATEGORY: {{.CategoryID}} ({{.CategoryName}})
 
-GUIDELINES:
+GUIDELINES (Tier 1 - Mandatory):
 {{.Guidelines}}
+{{.RAGContext}}
+CONTEXT:
+{{.Context}}
 
-PATIENT VALUES:
-{{.Metrics}}
-
-PRE-COMPUTED COMPARISON:
+ACTUAL VALUES WITH COMPARISON:
 {{.Comparison}}
 
-REQUIRED SEVERITY: {{.ExpectedSeverity}}
+EXPECTED SEVERITY: {{.ExpectedSeverity}}
 
-Generate ONE insight comparing the patient value to the guideline threshold.`
+OUTPUT (use severity="{{.ExpectedSeverity}}"):
+{
+  "insight": {
+    "text": "[State value, compare to threshold, give advice]",
+    "severity": "{{.ExpectedSeverity}}",
+    "reference": "[Source from guidelines] - [URL]",
+    "suggested_goal": { "metric": "{{.MetricName}}", "target": [threshold_value], "unit": "[unit]", "comparison": "gte", "description": "..." }
+  }
+}`
 
 const EducationalPromptTemplate = `CATEGORY: {{.CategoryID}} ({{.CategoryName}})
+TYPE: Educational "Did You Know" tip
 
-REFERENCES:
-{{.References}}
+CONTEXT:
+{{.Context}}
 
-Generate ONE "Did You Know" educational tip using the references above.
-Severity MUST be "info".`
+{{.RAGContext}}
+OUTPUT (severity MUST be "info"):
+{
+  "insight": {
+    "text": "Did you know? [educational fact]",
+    "severity": "info",
+    "reference": "[Source] - [URL]"
+  }
+}`
 
-const RegenerationPromptTemplate = `REGENERATION REQUIRED - Previous output failed validation.
+const RegenerationPromptTemplate = `
 
-VALIDATION ERROR: {{.Error}}
-
-CATEGORY: {{.CategoryID}}
-GUIDELINES: {{.Guidelines}}
-VALUES: {{.Metrics}}
-REQUIRED SEVERITY: {{.ExpectedSeverity}}
-
-Generate a VALID insight. Follow instructions EXACTLY.`
+PREVIOUS ATTEMPT FAILED VALIDATION: {{.Error}}
+Please fix the issue above and regenerate a valid insight.`

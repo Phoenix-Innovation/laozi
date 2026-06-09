@@ -92,7 +92,7 @@ func TestAnalyzeAllCategories(t *testing.T) {
 // in the batch, not just the first: a uniformly lying LLM still gets each
 // category's severity corrected independently.
 func TestAnalyzeEnforcesEveryCategory(t *testing.T) {
-	liar := mockLLM{resp: `{"insight":{"text":"All good.","severity":"success","reference":"X - https://evil.example"}}`}
+	liar := mockLLM{resp: `{"insight":{"text":"All good across the board, nothing to report.","severity":"success","reference":"X - https://evil.example"}}`}
 	e := New(WithLLM(liar))
 	e.AddCategories(liquidityCats())
 

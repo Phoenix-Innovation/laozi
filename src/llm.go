@@ -57,12 +57,12 @@ func WithTopP(p float64) DefaultLLMOption {
 // Override any field via DefaultLLMOption functional options.
 func NewDefaultLLMClient(opts ...DefaultLLMOption) *DefaultLLMClient {
 	c := &DefaultLLMClient{
-		client:   &http.Client{},
-		Model:    "gpt-4o-mini",
-		Endpoint: "https://api.openai.com/v1/chat/completions",
-		Temp:     0.3,
-		MaxTok:   500,
-		TopP:     0.9,
+		client:   &http.Client{Timeout: LLMTimeout},
+		Model:    LLMModel,
+		Endpoint: LLMEndpoint,
+		Temp:     LLMTemperature,
+		MaxTok:   LLMMaxTokens,
+		TopP:     LLMTopP,
 	}
 	for _, o := range opts {
 		o(c)
@@ -136,7 +136,11 @@ func (c *DefaultLLMClient) Chat(ctx context.Context, systemPrompt, userPrompt st
 	return result.Choices[0].Message.Content, nil
 }
 
-// GetAPIKey reads the API key from the LAOZI_API_KEY environment variable.
+// GetAPIKey reads the API key from the LAOZI_API_KEY environment variable,
+// falling back to the LLMAPIKey config constant when the env var is unset.
 func GetAPIKey() string {
-	return os.Getenv("LAOZI_API_KEY")
+	if k := os.Getenv("LAOZI_API_KEY"); k != "" {
+		return k
+	}
+	return LLMAPIKey
 }

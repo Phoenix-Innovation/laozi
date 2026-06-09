@@ -98,7 +98,7 @@ func TestTruthTable(t *testing.T) {
 			{Metric: "current_ratio", Min: 1.5, Max: 3.0, Unit: "ratio", Source: "CFA", SourceURL: "https://cfa/x"},
 			{Metric: "quick_ratio", Min: 1.0, Max: 2.0, Unit: "ratio", Source: "CFA", SourceURL: "https://cfa/x"},
 		}, metrics: map[string]float64{"current_ratio": 2.0, "quick_ratio": 0.5},
-			llmResp:      `{"insight":{"text":"Ratios reviewed.","severity":"success","reference":"CFA - https://cfa/x"}}`,
+			llmResp:      `{"insight":{"text":"Ratios reviewed against the stated guidelines.","severity":"success","reference":"CFA - https://cfa/x"}}`,
 			wantSeverity: SeverityWarning, wantViolations: []string{"severity"}},
 	}
 
