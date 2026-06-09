@@ -5,96 +5,79 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 
-	laozi "github.com/laozi/plugin"
+	laozi "github.com/Phoenix-Innovation/laozi"
 )
 
 func main() {
-	// Create LLM client
-	llmClient := laozi.NewOpenAIClient(
-		os.Getenv("LLM_ENDPOINT"),  // or "https://api.openai.com/v1"
-		os.Getenv("LLM_API_KEY"),
-		os.Getenv("LLM_MODEL"), // or "gpt-4o"
-	)
-
-	// Optional: Create RAG store with medical references
+	// Create RAG store and seed with medical references
 	rag := laozi.NewInMemoryRAG()
-	rag.Add(
-		"Adults should aim for 7,000-10,000 steps daily. Studies show 8,000+ steps reduces mortality risk by 51%.",
-		"Lancet Public Health 2022",
-		"https://www.thelancet.com/journals/lanpub/article/PIIS2468-2667(21)00302-9/fulltext",
-		"activity",
-	)
-	rag.Add(
-		"Fasting glucose below 100 mg/dL is normal. 100-125 mg/dL indicates prediabetes. 126+ indicates diabetes.",
-		"American Diabetes Association",
-		"https://diabetes.org/about-diabetes/diagnosis",
-		"glucose",
-	)
+	rag.Add(laozi.RAGResult{
+		Content:   "Adults should aim for 7,000-10,000 steps daily. Studies show 8,000+ steps reduces mortality risk by 51%.",
+		Source:    "Lancet Public Health 2022",
+		SourceURL: "https://www.thelancet.com/journals/lanpub/article/PIIS2468-2667(21)00302-9/fulltext",
+	})
+	rag.Add(laozi.RAGResult{
+		Content:   "Fasting glucose below 100 mg/dL is normal. 100-125 mg/dL indicates prediabetes. 126+ indicates diabetes.",
+		Source:    "American Diabetes Association",
+		SourceURL: "https://diabetes.org/about-diabetes/diagnosis",
+	})
+	rag.Add(laozi.RAGResult{
+		Content:   "Did you know? Eating 25-30g of fiber daily can reduce heart disease risk by 30%.",
+		Source:    "Harvard Health",
+		SourceURL: "https://www.health.harvard.edu/nutrition",
+	})
 
-	// Create Laozi engine
+	// Create engine with functional options
 	engine := laozi.New(
-		laozi.WithLLM(llmClient),
-		laozi.WithRAG(rag), // optional
+		laozi.WithLLM(laozi.NewDefaultLLMClient()),
+		laozi.WithRAG(rag),
+		laozi.WithConfig(laozi.Config{MaxRetries: 2, MaxParallel: 4}),
 		laozi.WithContext("patient", map[string]interface{}{
 			"age":    45,
 			"gender": "male",
 		}),
 	)
 
-	// Define health metric thresholds (Tier 1 - hardcoded constraints)
+	// Define health metric categories with thresholds
 	engine.AddCategories([]laozi.Category{
 		{
 			ID:   "activity",
 			Name: "Physical Activity",
-			Thresholds: []laozi.Threshold{
-				{
-					Metric:      "steps",
-					Min:         8000,
-					Max:         15000,
-					OptimalMin:  8000,
-					OptimalMax:  10000,
-					Unit:        "steps/day",
-					Source:      "Lancet Public Health 2022",
-					SourceURL:   "https://www.thelancet.com/journals/lanpub/article/PIIS2468-2667(21)00302-9/fulltext",
-					Description: "8,000-10,000 steps/day associated with optimal mortality benefit",
-				},
-			},
-			RAGQuery: "daily steps physical activity guidelines",
+			Thresholds: []laozi.Threshold{{
+				Metric:    "steps",
+				Min:       8000,
+				Max:       15000,
+				Unit:      "steps/day",
+				Source:    "Lancet Public Health 2022",
+				SourceURL: "https://www.thelancet.com/journals/lanpub/article/PIIS2468-2667(21)00302-9/fulltext",
+			}},
+			RAGQuery: "daily steps physical activity",
 		},
 		{
 			ID:   "glucose",
 			Name: "Metabolic Health",
-			Thresholds: []laozi.Threshold{
-				{
-					Metric:      "fasting_glucose",
-					Min:         70,
-					Max:         99,
-					OptimalMin:  70,
-					OptimalMax:  90,
-					Unit:        "mg/dL",
-					Source:      "American Diabetes Association",
-					SourceURL:   "https://diabetes.org/about-diabetes/diagnosis",
-					Description: "Prediabetes: 100-125 mg/dL, Diabetes: ≥126 mg/dL",
-				},
-			},
-			RAGQuery: "fasting glucose diabetes prediabetes",
+			Thresholds: []laozi.Threshold{{
+				Metric:    "fasting_glucose",
+				Min:       70,
+				Max:       99,
+				Unit:      "mg/dL",
+				Source:    "American Diabetes Association",
+				SourceURL: "https://diabetes.org/about-diabetes/diagnosis",
+			}},
+			RAGQuery: "fasting glucose diabetes",
 		},
 		{
 			ID:   "blood-pressure",
 			Name: "Blood Pressure",
 			Thresholds: []laozi.Threshold{
 				{
-					Metric:      "systolic_bp",
-					Min:         90,
-					Max:         119,
-					OptimalMin:  90,
-					OptimalMax:  120,
-					Unit:        "mmHg",
-					Source:      "Harvard Health Publishing",
-					SourceURL:   "https://www.health.harvard.edu/heart-health/reading-the-new-blood-pressure-guidelines",
-					Description: "Normal: <120/80, Elevated: 120-129/<80, Hypertension: ≥130/80",
+					Metric:    "systolic_bp",
+					Min:       90,
+					Max:       119,
+					Unit:      "mmHg",
+					Source:    "Harvard Health Publishing",
+					SourceURL: "https://www.health.harvard.edu/heart-health/reading-the-new-blood-pressure-guidelines",
 				},
 				{
 					Metric:    "diastolic_bp",
@@ -110,17 +93,16 @@ func main() {
 			ID:          "nutrition-tips",
 			Name:        "Nutrition Tips",
 			Educational: true,
-			Thresholds:  []laozi.Threshold{},
-			RAGQuery:    "nutrition dietary guidelines health tips",
+			RAGQuery:    "nutrition dietary guidelines fiber",
 		},
 	})
 
 	// Patient's actual metrics
 	metrics := map[string]float64{
-		"steps":           5200,  // Below target
-		"fasting_glucose": 108,   // Prediabetes range
-		"systolic_bp":     128,   // Elevated
-		"diastolic_bp":    82,    // Stage 1 hypertension
+		"steps":           5200, // Below 8000 -> warning
+		"fasting_glucose": 108,  // Above 99 -> warning (prediabetes)
+		"systolic_bp":     128,  // Above 119 -> warning
+		"diastolic_bp":    82,   // Above 79 -> warning
 	}
 
 	// Generate insights
