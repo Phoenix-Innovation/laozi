@@ -11,10 +11,12 @@
 //
 // Usage:
 //
+//      var myLLM laozi.LLMClient = ... // any type implementing Chat(ctx, system, user string) (string, error)
+//
 //      engine := laozi.New(
-//              laozi.WithLLM("https://api.openai.com/v1", "your-api-key", "gpt-4o"),
+//              laozi.WithLLM(myLLM),
 //              laozi.WithRAG(myRAGStore), // optional
-//              laozi.WithStrict(true),     // optional: replace LLM prose on number violations
+//              laozi.WithStrict(true),    // optional: replace LLM prose on number violations
 //      )
 //
 //      // Define your domain thresholds
@@ -22,7 +24,8 @@
 //              ID:   "revenue",
 //              Name: "Revenue Analysis",
 //              Thresholds: []laozi.Threshold{
-//                      {Metric: "monthly_revenue", Min: 100000, Max: 500000, Unit: "USD"},
+//                      {Metric: "monthly_revenue", Min: 100000, Max: 500000, Unit: "USD",
+//                       Source: "Finance Team", SourceURL: "https://example.com/policy"},
 //              },
 //      })
 //
