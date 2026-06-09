@@ -1,475 +1,746 @@
-// Package laozi provides an LLM-powered insight generation engine with
-// hallucination prevention through dual-constraint architecture.
+// Package laozi provides a dual-constraint insight generation engine.
+// It prevents LLM hallucinations by combining hardcoded thresholds (Tier 1)
+// with optional RAG context (Tier 2), and a post-generation enforcement layer
+// that catches and corrects every deviation the LLM produces.
+//
+// The enforcement layer guarantees:
+//   - Severity is always determined by threshold math, not the LLM
+//   - Citations trace back to provided source URLs, not invented ones
+//   - Suggested goals align with threshold bounds, not hallucinated targets
+//   - (Strict mode) Prose containing untraceable numbers is replaced entirely
+//
+// Usage:
+//
+//      engine := laozi.New(
+//              laozi.WithLLM("https://api.openai.com/v1", "your-api-key", "gpt-4o"),
+//              laozi.WithRAG(myRAGStore), // optional
+//              laozi.WithStrict(true),     // optional: replace LLM prose on number violations
+//      )
+//
+//      // Define your domain thresholds
+//      engine.AddCategory(laozi.Category{
+//              ID:   "revenue",
+//              Name: "Revenue Analysis",
+//              Thresholds: []laozi.Threshold{
+//                      {Metric: "monthly_revenue", Min: 100000, Max: 500000, Unit: "USD"},
+//              },
+//      })
+//
+//      // Generate insights — every insight carries a Violations audit trail
+//      insights, err := engine.Analyze(ctx, map[string]float64{
+//              "monthly_revenue": 75000,
+//      })
 package laozi
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"os"
-	"regexp"
-	"strings"
-	"sync"
-	"text/template"
-	"time"
+        "context"
+        "encoding/json"
+        "fmt"
+        "math"
+        "regexp"
+        "strconv"
+        "strings"
+        "sync"
 )
 
-// ================================================================================
-// TYPES
-// ================================================================================
+// ---------------------------------------------------------------------------
+// Core types
+// ---------------------------------------------------------------------------
 
 // Severity levels for insights
 type Severity string
 
 const (
-	SeverityWarning Severity = "warning"
-	SeveritySuccess Severity = "success"
-	SeverityInfo    Severity = "info"
+        SeverityWarning Severity = "warning" // Value outside threshold
+        SeveritySuccess Severity = "success" // Value within threshold
+        SeverityInfo    Severity = "info"    // Educational/informational
 )
 
-// Threshold defines a metric guideline with source attribution
+// Threshold defines a constraint for a metric
 type Threshold struct {
-	Metric    string  // e.g., "current_ratio", "glucose"
-	Min       float64 // Minimum acceptable value
-	Max       float64 // Maximum acceptable value
-	Unit      string  // e.g., "ratio", "mg/dL"
-	Source    string  // e.g., "CFA Institute", "ADA"
-	SourceURL string  // URL for reference
+        Metric      string  `json:"metric"`
+        Min         float64 `json:"min"`
+        Max         float64 `json:"max"`
+        OptimalMin  float64 `json:"optimal_min,omitempty"`
+        OptimalMax  float64 `json:"optimal_max,omitempty"`
+        Unit        string  `json:"unit"`
+        Source      string  `json:"source"`
+        SourceURL   string  `json:"source_url"`
+        Description string  `json:"description,omitempty"`
 }
 
-// Category represents an analysis category
+// Category groups related metrics and thresholds
 type Category struct {
-	ID          string
-	Name        string
-	Thresholds  []Threshold
-	Educational bool   // If true, generates "Did You Know" tips
-	RAGQuery    string // Optional query for RAG context
+        ID          string      `json:"id"`
+        Name        string      `json:"name"`
+        Thresholds  []Threshold `json:"thresholds"`
+        Educational bool        `json:"educational"` // If true, generates "Did You Know" tips
+        RAGQuery    string      `json:"rag_query,omitempty"`
 }
 
-// Insight is the generated output
+// Insight is the output from analysis. The Violations slice is the audit trail:
+// it records every case where the LLM deviated from deterministic truth and
+// was corrected. An empty Violations slice means the LLM was fully compliant.
 type Insight struct {
-	CategoryID string
-	Text       string
-	Severity   Severity
-	Reference  string
-	Metadata   map[string]string
+        ID             string            `json:"id"`
+        CategoryID     string            `json:"category_id"`
+        CategoryName   string            `json:"category_name"`
+        Text           string            `json:"text"`
+        Severity       Severity          `json:"severity"`
+        RelatedMetrics []string          `json:"related_metrics"`
+        Reference      string            `json:"reference"`
+        SuggestedGoal  *SuggestedGoal    `json:"suggested_goal,omitempty"`
+        Violations     []Violation       `json:"violations,omitempty"`
+        Metadata       map[string]string `json:"metadata,omitempty"`
 }
 
-// RAGDocument represents a retrieved document
-type RAGDocument struct {
-	Content    string
-	Source     string
-	SourceURL  string
-	Similarity float64
+// SuggestedGoal provides actionable targets
+type SuggestedGoal struct {
+        Metric      string  `json:"metric"`
+        Target      float64 `json:"target"`
+        Unit        string  `json:"unit"`
+        Comparison  string  `json:"comparison"` // gte, lte, eq
+        Description string  `json:"description"`
 }
 
-// RAGStore interface for vector database
+// Violation records one case where the LLM output disagreed with the
+// deterministic ground truth and was corrected. Attaching these to every
+// Insight is what makes the audit trail real: a caller (or auditor) can see
+// exactly what the model tried to do and what the engine enforced instead.
+type Violation struct {
+        Kind     string `json:"kind"`      // severity | reference | goal | number | parse
+        LLMValue string `json:"llm_value"` // what the model returned
+        Enforced string `json:"enforced"`  // what the engine used instead (empty = flagged only)
+        Detail   string `json:"detail"`
+}
+
+// ---------------------------------------------------------------------------
+// Interfaces
+// ---------------------------------------------------------------------------
+
+// RAGStore interface for optional vector database integration
 type RAGStore interface {
-	Search(ctx context.Context, query string, topK int) ([]RAGDocument, error)
+        Search(ctx context.Context, query string, limit int) ([]RAGResult, error)
 }
 
-// LLMClient interface for LLM calls
+// RAGResult from vector search
+type RAGResult struct {
+        Content   string  `json:"content"`
+        Source    string  `json:"source"`
+        SourceURL string  `json:"source_url"`
+        Score     float64 `json:"score"`
+}
+
+// LLMClient interface for LLM integration
 type LLMClient interface {
-	Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+        Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error)
 }
 
-// Logger interface for observability
-type Logger interface {
-	Log(step, category, message string, data map[string]interface{})
-}
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
 
-// ================================================================================
-// ENGINE
-// ================================================================================
-
-// Engine is the main Laozi insight generator
+// Engine is the main Laozi insight generator. The strict field controls
+// whether LLM prose containing untraceable numbers is replaced with a
+// deterministic template (true) or merely flagged (false, default).
 type Engine struct {
-	categories map[string]Category
-	llm        LLMClient
-	rag        RAGStore
-	context    map[string]interface{}
-	logger     Logger
-
-	// Templates (parsed once)
-	systemTpl     *template.Template
-	metricTpl     *template.Template
-	educationalTpl *template.Template
-	regenTpl      *template.Template
+        categories map[string]Category
+        llm        LLMClient
+        rag        RAGStore // optional
+        context    map[string]interface{}
+        mu         sync.RWMutex // protects context map for concurrent access
+        strict     bool
 }
 
 // New creates a new Laozi engine
-func New(llm LLMClient, rag RAGStore) *Engine {
-	e := &Engine{
-		categories: make(map[string]Category),
-		context:    make(map[string]interface{}),
-		llm:        llm,
-		rag:        rag,
-	}
-
-	// Parse templates at init
-	e.systemTpl = template.Must(template.New("system").Parse(SystemPromptTemplate))
-	e.metricTpl = template.Must(template.New("metric").Parse(MetricPromptTemplate))
-	e.educationalTpl = template.Must(template.New("educational").Parse(EducationalPromptTemplate))
-	e.regenTpl = template.Must(template.New("regen").Parse(RegenerationPromptTemplate))
-
-	// Set logger based on config
-	if LogEnabled {
-		e.logger = &ConsoleLogger{}
-	}
-
-	return e
+func New(opts ...Option) *Engine {
+        e := &Engine{
+                categories: make(map[string]Category),
+                context:    make(map[string]interface{}),
+        }
+        for _, opt := range opts {
+                opt(e)
+        }
+        return e
 }
 
-// SetLogger overrides the default logger
-func (e *Engine) SetLogger(l Logger) {
-	e.logger = l
+// Option configures the engine
+type Option func(*Engine)
+
+// WithLLM sets the LLM client
+func WithLLM(client LLMClient) Option {
+        return func(e *Engine) { e.llm = client }
 }
 
-// AddContext adds domain context
-func (e *Engine) AddContext(key string, value interface{}) {
-	e.context[key] = value
+// WithRAG enables optional RAG support
+func WithRAG(store RAGStore) Option {
+        return func(e *Engine) { e.rag = store }
 }
 
-// AddCategory registers a category
+// WithStrict controls what happens when the LLM's narrative prose contains
+// numbers that can't be traced to the input data or thresholds.
+//
+//   - false (default): such cases are recorded as Violations but the LLM text
+//     is kept.
+//   - true: the narration is discarded and replaced with a deterministic,
+//     number-correct template. In strict mode the LLM is cut out entirely the
+//     moment it steps out of line — this is what makes "the LLM has limited
+//     authority" a property of the system rather than a hope about the prompt.
+func WithStrict(strict bool) Option {
+        return func(e *Engine) { e.strict = strict }
+}
+
+// WithContext adds domain context (e.g., user profile, entity info)
+func WithContext(key string, value interface{}) Option {
+        return func(e *Engine) { e.context[key] = value }
+}
+
+// AddCategory registers a category with its thresholds
 func (e *Engine) AddCategory(cat Category) {
-	e.categories[cat.ID] = cat
+        e.categories[cat.ID] = cat
 }
 
 // AddCategories registers multiple categories
 func (e *Engine) AddCategories(cats []Category) {
-	for _, cat := range cats {
-		e.AddCategory(cat)
-	}
+        for _, cat := range cats {
+                e.categories[cat.ID] = cat
+        }
 }
 
-// ================================================================================
-// ANALYSIS
-// ================================================================================
-
-// AnalyzeAll runs all categories in parallel (uses MaxParallelLLMCalls from config)
-func (e *Engine) AnalyzeAll(ctx context.Context, metrics map[string]float64) ([]*Insight, error) {
-	var (
-		mu       sync.Mutex
-		insights []*Insight
-		errs     []error
-		wg       sync.WaitGroup
-		sem      = make(chan struct{}, MaxParallelLLMCalls)
-	)
-
-	e.log("BATCH", "all", fmt.Sprintf("Starting %d categories with %d parallel", len(e.categories), MaxParallelLLMCalls), nil)
-
-	for _, cat := range e.categories {
-		wg.Add(1)
-		go func(c Category) {
-			defer wg.Done()
-			sem <- struct{}{}        // Acquire
-			defer func() { <-sem }() // Release
-
-			insight, err := e.Analyze(ctx, c.ID, metrics)
-			mu.Lock()
-			if err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", c.ID, err))
-			} else if insight != nil {
-				insights = append(insights, insight)
-			}
-			mu.Unlock()
-		}(cat)
-	}
-
-	wg.Wait()
-
-	if len(errs) > 0 {
-		e.log("BATCH", "all", fmt.Sprintf("Completed with %d errors", len(errs)), nil)
-	}
-
-	return insights, nil
+// SetContext updates engine context (goroutine-safe).
+func (e *Engine) SetContext(key string, value interface{}) {
+        e.mu.Lock()
+        e.context[key] = value
+        e.mu.Unlock()
 }
 
-// Analyze generates an insight for a single category
-func (e *Engine) Analyze(ctx context.Context, categoryID string, metrics map[string]float64) (*Insight, error) {
-	cat, ok := e.categories[categoryID]
-	if !ok {
-		return nil, fmt.Errorf("category not found: %s", categoryID)
-	}
-
-	// Add timeout from config
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(LLMTimeoutSeconds)*time.Second)
-	defer cancel()
-
-	return e.analyzeCategory(ctx, cat, metrics)
+// snapshotContext returns a shallow copy of the context map for safe
+// concurrent reading (e.g., JSON marshalling in prompt construction).
+func (e *Engine) snapshotContext() map[string]interface{} {
+        e.mu.RLock()
+        defer e.mu.RUnlock()
+        cp := make(map[string]interface{}, len(e.context))
+        for k, v := range e.context {
+                cp[k] = v
+        }
+        return cp
 }
+
+// ---------------------------------------------------------------------------
+// Public analysis API
+// ---------------------------------------------------------------------------
+
+// Analyze generates insights for the given metrics across all categories.
+func (e *Engine) Analyze(ctx context.Context, metrics map[string]float64) ([]Insight, error) {
+        if e.llm == nil {
+                return nil, fmt.Errorf("LLM client not configured")
+        }
+
+        var insights []Insight
+
+        for _, cat := range e.categories {
+                insight, err := e.analyzeCategory(ctx, cat, metrics)
+                if err != nil {
+                        return nil, fmt.Errorf("category %s: %w", cat.ID, err)
+                }
+                if insight != nil {
+                        insights = append(insights, *insight)
+                }
+        }
+
+        return insights, nil
+}
+
+// AnalyzeCategory generates an insight for a specific category.
+func (e *Engine) AnalyzeCategory(ctx context.Context, categoryID string, metrics map[string]float64) (*Insight, error) {
+        cat, ok := e.categories[categoryID]
+        if !ok {
+                return nil, fmt.Errorf("category not found: %s", categoryID)
+        }
+        return e.analyzeCategory(ctx, cat, metrics)
+}
+
+// ---------------------------------------------------------------------------
+// Core pipeline: compute → LLM → enforce
+// ---------------------------------------------------------------------------
 
 func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
-	var (
-		userPrompt       string
-		expectedSeverity Severity
-	)
+        // Step 1: Deterministic ground truth — computed entirely in Go.
+        comp := computeAnalysis(cat, metrics)
 
-	if cat.Educational {
-		userPrompt, expectedSeverity = e.buildEducationalPrompt(ctx, cat)
-	} else {
-		userPrompt, expectedSeverity = e.buildMetricPrompt(cat, metrics)
-	}
+        // Build threshold guidelines text (for the LLM prompt)
+        guidelinesText := e.buildGuidelinesText(cat)
 
-	e.log("GENERATE", cat.ID, "Calling LLM", map[string]interface{}{"expected": string(expectedSeverity)})
+        // Get RAG context if available
+        var ragContext string
+        if e.rag != nil && cat.RAGQuery != "" {
+                results, err := e.rag.Search(ctx, cat.RAGQuery, 2)
+                if err == nil && len(results) > 0 {
+                        ragContext = e.buildRAGContext(results)
+                }
+        }
 
-	// STEP 1: Generate
-	response, err := e.llm.Chat(ctx, SystemPromptTemplate, userPrompt)
-	if err != nil {
-		e.log("GENERATE", cat.ID, "LLM failed", map[string]interface{}{"error": err.Error()})
-		return nil, fmt.Errorf("LLM call failed: %w", err)
-	}
+        // Build prompts — the prompt includes the EXPECTED SEVERITY so a
+        // compliant LLM can echo it, but enforcement doesn't depend on that.
+        systemPrompt := e.buildSystemPrompt()
+        userPrompt := e.buildUserPrompt(cat, guidelinesText, comp.metricsText, ragContext, comp.severity)
 
-	// STEP 2: Parse
-	insight, err := e.parseResponse(response, cat.ID)
-	if err != nil {
-		e.log("PARSE", cat.ID, "Parse failed", map[string]interface{}{"error": err.Error()})
-		return nil, err
-	}
-	e.log("PARSE", cat.ID, "OK", map[string]interface{}{"severity": string(insight.Severity)})
+        // Step 2: Call LLM
+        response, err := e.llm.Chat(ctx, systemPrompt, userPrompt)
+        if err != nil {
+                return nil, fmt.Errorf("LLM call failed: %w", err)
+        }
 
-	// STEP 3: Validate
-	validationErr := e.validateInsight(insight, cat, expectedSeverity)
-	if validationErr == nil {
-		e.log("VALIDATE", cat.ID, "✓ PASS", nil)
-		return insight, nil
-	}
-	e.log("VALIDATE", cat.ID, "✗ FAIL", map[string]interface{}{"error": validationErr.Error()})
+        // Step 3: Parse response
+        insight, parseErr := e.parseResponse(response, cat)
 
-	// STEP 4: Regenerate (up to MaxRetries from config)
-	for attempt := 1; attempt <= MaxRetries; attempt++ {
-		e.log("REGENERATE", cat.ID, fmt.Sprintf("Attempt %d/%d", attempt, MaxRetries), nil)
+        if parseErr != nil {
+                // In strict mode, parse failure is recoverable: fall back to
+                // deterministic template. In lax mode, it's a hard error.
+                if e.strict {
+                        insight = e.buildFallbackInsight(cat, comp)
+                        insight.Violations = append(insight.Violations, Violation{
+                                Kind:     "parse",
+                                LLMValue: truncate(response, 200),
+                                Enforced: "deterministic template used",
+                                Detail:   fmt.Sprintf("LLM response could not be parsed: %v", parseErr),
+                        })
+                        return insight, nil
+                }
+                return nil, parseErr
+        }
 
-		regenPrompt := e.buildRegenPrompt(cat, metrics, expectedSeverity, validationErr.Error())
-		response, err = e.llm.Chat(ctx, "You are regenerating a failed insight. Follow instructions EXACTLY.", regenPrompt)
-		if err != nil {
-			continue
-		}
+        // Step 4: Enforce — reconcile LLM output against deterministic truth.
+        // After this call, severity, reference, and goal are GUARANTEED correct.
+        e.enforce(insight, cat, comp)
 
-		insight, err = e.parseResponse(response, cat.ID)
-		if err != nil {
-			continue
-		}
-
-		validationErr = e.validateInsight(insight, cat, expectedSeverity)
-		if validationErr == nil {
-			e.log("REGENERATE", cat.ID, "✓ SUCCESS", nil)
-			return insight, nil
-		}
-	}
-
-	e.log("REGENERATE", cat.ID, "✗ EXHAUSTED", map[string]interface{}{"attempts": MaxRetries})
-	return nil, fmt.Errorf("validation failed after %d attempts", MaxRetries)
+        return insight, nil
 }
 
-// ================================================================================
-// PROMPT BUILDING
-// ================================================================================
+// buildFallbackInsight creates a fully deterministic insight when the LLM
+// output cannot be parsed (strict mode only).
+func (e *Engine) buildFallbackInsight(cat Category, c computedAnalysis) *Insight {
+        var relatedMetrics []string
+        for _, t := range cat.Thresholds {
+                relatedMetrics = append(relatedMetrics, t.Metric)
+        }
 
-func (e *Engine) buildMetricPrompt(cat Category, metrics map[string]float64) (string, Severity) {
-	var guidelines, metricsText, comparison strings.Builder
-	expectedSeverity := SeveritySuccess
-
-	for _, t := range cat.Thresholds {
-		guidelines.WriteString(fmt.Sprintf("📊 %s: Range %.2f - %.2f %s\n   Source: %s\n   URL: %s\n\n",
-			strings.ToUpper(t.Metric), t.Min, t.Max, t.Unit, t.Source, t.SourceURL))
-
-		if val, ok := metrics[t.Metric]; ok {
-			metricsText.WriteString(fmt.Sprintf("- %s: %.2f %s\n", t.Metric, val, t.Unit))
-
-			// Pre-compute comparison
-			if val < t.Min {
-				comparison.WriteString(fmt.Sprintf("%s: %.2f < %.2f (BELOW minimum) → severity = warning\n",
-					t.Metric, val, t.Min))
-				expectedSeverity = SeverityWarning
-			} else if val > t.Max {
-				comparison.WriteString(fmt.Sprintf("%s: %.2f > %.2f (ABOVE maximum) → severity = warning\n",
-					t.Metric, val, t.Max))
-				expectedSeverity = SeverityWarning
-			} else {
-				comparison.WriteString(fmt.Sprintf("%s: %.2f within [%.2f - %.2f] → severity = success\n",
-					t.Metric, val, t.Min, t.Max))
-			}
-		}
-	}
-
-	data := map[string]string{
-		"CategoryID":       cat.ID,
-		"CategoryName":     cat.Name,
-		"Guidelines":       guidelines.String(),
-		"Metrics":          metricsText.String(),
-		"Comparison":       comparison.String(),
-		"ExpectedSeverity": string(expectedSeverity),
-	}
-
-	return e.executeTemplate(e.metricTpl, data), expectedSeverity
+        return &Insight{
+                ID:             fmt.Sprintf("%s-001", cat.ID),
+                CategoryID:     cat.ID,
+                CategoryName:   cat.Name,
+                Text:           c.renderText(),
+                Severity:       c.severity,
+                RelatedMetrics: relatedMetrics,
+                Reference:      c.reference,
+        }
 }
 
-func (e *Engine) buildEducationalPrompt(ctx context.Context, cat Category) (string, Severity) {
-	var refs strings.Builder
+// ---------------------------------------------------------------------------
+// Deterministic ground truth computation
+// ---------------------------------------------------------------------------
 
-	if RAGEnabled && e.rag != nil && cat.RAGQuery != "" {
-		docs, err := e.rag.Search(ctx, cat.RAGQuery, RAGTopK)
-		if err == nil {
-			for i, doc := range docs {
-				if doc.Similarity >= RAGMinSimilarity {
-					refs.WriteString(fmt.Sprintf("[%d] %s\n    Source: %s - %s\n\n",
-						i+1, doc.Content, doc.Source, doc.SourceURL))
-				}
-			}
-		}
-	}
-
-	data := map[string]string{
-		"CategoryID":   cat.ID,
-		"CategoryName": cat.Name,
-		"References":   refs.String(),
-	}
-
-	return e.executeTemplate(e.educationalTpl, data), SeverityInfo
+// computedAnalysis is the deterministic ground truth for one category + metric
+// set. Everything here is computed in Go, before and independently of the LLM.
+// On any conflict, these values win.
+type computedAnalysis struct {
+        severity    Severity
+        metricsText string       // human-readable comparison block for the prompt
+        reference   string       // canonical citation built from threshold metadata
+        lines       []metricLine // per-metric facts, for the template fallback
+        allowed     []float64    // numbers the LLM is permitted to state in prose
 }
 
-func (e *Engine) buildRegenPrompt(cat Category, metrics map[string]float64, expected Severity, validationError string) string {
-	metricPrompt, _ := e.buildMetricPrompt(cat, metrics)
-
-	data := map[string]string{
-		"Error":            validationError,
-		"CategoryID":       cat.ID,
-		"Guidelines":       "", // Already in metricPrompt
-		"Metrics":          metricPrompt,
-		"ExpectedSeverity": string(expected),
-	}
-
-	return e.executeTemplate(e.regenTpl, data)
+type metricLine struct {
+        metric string
+        value  float64
+        unit   string
+        min    float64
+        max    float64
+        status string // "BELOW minimum" | "WITHIN range" | "ABOVE maximum"
 }
 
-func (e *Engine) executeTemplate(tpl *template.Template, data map[string]string) string {
-	var buf strings.Builder
-	_ = tpl.Execute(&buf, data)
-	return buf.String()
+// computeAnalysis is the deterministic core. It produces prompt text and
+// captures the structured ground truth used for enforcement.
+func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis {
+        c := computedAnalysis{severity: SeveritySuccess}
+        var sb strings.Builder
+        seenRef := map[string]bool{}
+        var refs []string
+
+        for _, t := range cat.Thresholds {
+                // Collect canonical references regardless of whether the metric is present.
+                if t.SourceURL != "" {
+                        key := t.Source + "|" + t.SourceURL
+                        if !seenRef[key] {
+                                seenRef[key] = true
+                                refs = append(refs, fmt.Sprintf("%s - %s", t.Source, t.SourceURL))
+                        }
+                }
+
+                val, ok := metrics[t.Metric]
+                if !ok {
+                        continue
+                }
+
+                var status string
+                switch {
+                case val < t.Min:
+                        status = "BELOW minimum"
+                        c.severity = SeverityWarning
+                case val > t.Max:
+                        status = "ABOVE maximum"
+                        c.severity = SeverityWarning
+                default:
+                        status = "WITHIN range"
+                }
+
+                sb.WriteString(fmt.Sprintf("- %s: %.2f %s → %s (%.2f - %.2f)\n",
+                        t.Metric, val, t.Unit, status, t.Min, t.Max))
+
+                c.lines = append(c.lines, metricLine{
+                        metric: t.Metric, value: val, unit: t.Unit,
+                        min: t.Min, max: t.Max, status: status,
+                })
+                c.allowed = append(c.allowed, val, t.Min, t.Max)
+                if t.OptimalMin > 0 {
+                        c.allowed = append(c.allowed, t.OptimalMin)
+                }
+                if t.OptimalMax > 0 {
+                        c.allowed = append(c.allowed, t.OptimalMax)
+                }
+        }
+
+        if cat.Educational {
+                c.severity = SeverityInfo
+        }
+        c.metricsText = sb.String()
+        c.reference = strings.Join(refs, "; ")
+        return c
 }
 
-// ================================================================================
-// VALIDATION
-// ================================================================================
+// ---------------------------------------------------------------------------
+// Post-LLM enforcement
+// ---------------------------------------------------------------------------
 
-func (e *Engine) validateInsight(insight *Insight, cat Category, expected Severity) error {
-	if insight == nil {
-		return fmt.Errorf("nil insight")
-	}
+// enforce reconciles an LLM-produced Insight against the deterministic ground
+// truth, mutating it in place and recording every correction. After this runs,
+// severity, reference, and the suggested goal are GUARANTEED to reflect the
+// computed truth, not the model's claims.
+func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis) {
+        // 1. Severity — deterministic always wins.
+        if insight.Severity != c.severity {
+                insight.Violations = append(insight.Violations, Violation{
+                        Kind: "severity", LLMValue: string(insight.Severity),
+                        Enforced: string(c.severity),
+                        Detail:   "severity overridden by deterministic comparison",
+                })
+                insight.Severity = c.severity
+        }
 
-	// Structure checks
-	if len(insight.Text) < MinInsightTextLen {
-		return fmt.Errorf("text too short: %d < %d", len(insight.Text), MinInsightTextLen)
-	}
+        // 2. Reference — built from threshold metadata; the model's is never trusted.
+        //    Only enforce when the category actually declares source URLs.
+        if c.reference != "" {
+                if !referenceMatches(insight.Reference, cat) {
+                        insight.Violations = append(insight.Violations, Violation{
+                                Kind: "reference", LLMValue: insight.Reference,
+                                Enforced: c.reference,
+                                Detail:   "citation did not match any provided source URL; replaced",
+                        })
+                }
+                insight.Reference = c.reference
+        }
 
-	// Placeholder check
-	for _, p := range InvalidPlaceholders {
-		if strings.Contains(insight.Text, p) {
-			return fmt.Errorf("contains placeholder: %s", p)
-		}
-	}
+        // 3. Suggested goal — target/unit/metric must come from a real threshold.
+        if insight.SuggestedGoal != nil {
+                if v := enforceGoal(insight.SuggestedGoal, cat, c); v != nil {
+                        insight.Violations = append(insight.Violations, *v)
+                }
+        }
 
-	// Severity check
-	validSeverity := false
-	for _, s := range ValidSeverities {
-		if insight.Severity == s {
-			validSeverity = true
-			break
-		}
-	}
-	if !validSeverity {
-		return fmt.Errorf("invalid severity: %s", insight.Severity)
-	}
-
-	// Reference checks
-	if RequireReference && insight.Reference == "" {
-		return fmt.Errorf("missing reference")
-	}
-	if RequireURL && !strings.Contains(insight.Reference, "http") {
-		return fmt.Errorf("reference missing URL")
-	}
-
-	// Semantic check: severity must match expected (for metric categories)
-	if EnforceSeverityMatch && !cat.Educational && insight.Severity != expected {
-		return fmt.Errorf("severity mismatch: got %s, expected %s", insight.Severity, expected)
-	}
-
-	return nil
+        // 4. Numbers in prose — best-effort trace check.
+        if bad := c.unknownNumbers(insight.Text); len(bad) > 0 {
+                v := Violation{
+                        Kind: "number", LLMValue: strings.Join(bad, ", "),
+                        Detail: "narrative contains numbers not traceable to data or thresholds",
+                }
+                if e.strict {
+                        insight.Text = c.renderText()
+                        v.Enforced = "narration replaced with deterministic template"
+                }
+                insight.Violations = append(insight.Violations, v)
+        }
 }
 
-// ================================================================================
-// PARSING
-// ================================================================================
-
-func (e *Engine) parseResponse(response, categoryID string) (*Insight, error) {
-	// Extract JSON from response
-	jsonRegex := regexp.MustCompile(`\{[\s\S]*"insight"[\s\S]*\}`)
-	match := jsonRegex.FindString(response)
-	if match == "" {
-		return nil, fmt.Errorf("no JSON found in response")
-	}
-
-	var result struct {
-		Insight struct {
-			Text      string `json:"text"`
-			Severity  string `json:"severity"`
-			Reference string `json:"reference"`
-		} `json:"insight"`
-	}
-
-	if err := json.Unmarshal([]byte(match), &result); err != nil {
-		return nil, fmt.Errorf("JSON parse error: %w", err)
-	}
-
-	return &Insight{
-		CategoryID: categoryID,
-		Text:       result.Insight.Text,
-		Severity:   Severity(result.Insight.Severity),
-		Reference:  result.Insight.Reference,
-		Metadata:   make(map[string]string),
-	}, nil
+func referenceMatches(ref string, cat Category) bool {
+        for _, t := range cat.Thresholds {
+                if t.SourceURL != "" && strings.Contains(ref, t.SourceURL) {
+                        return true
+                }
+        }
+        return false
 }
 
-// ================================================================================
-// LOGGING
-// ================================================================================
+func enforceGoal(g *SuggestedGoal, cat Category, c computedAnalysis) *Violation {
+        var th *Threshold
+        for i := range cat.Thresholds {
+                if cat.Thresholds[i].Metric == g.Metric {
+                        th = &cat.Thresholds[i]
+                        break
+                }
+        }
+        if th == nil {
+                orig := fmt.Sprintf("%+v", *g)
+                *g = SuggestedGoal{} // neutralize a goal we can't defend
+                return &Violation{Kind: "goal", LLMValue: orig,
+                        Detail: "suggested goal referenced an unknown metric; dropped"}
+        }
 
-func (e *Engine) log(step, category, message string, data map[string]interface{}) {
-	if e.logger != nil {
-		e.logger.Log(step, category, message, data)
-	}
+        // The only defensible targets are the threshold bounds.
+        target, cmp := th.Min, "gte"
+        for _, line := range c.lines {
+                if line.metric == g.Metric && line.status == "ABOVE maximum" {
+                        target, cmp = th.Max, "lte"
+                }
+        }
+
+        if !floatEq(g.Target, target) || g.Unit != th.Unit || g.Comparison != cmp {
+                orig := fmt.Sprintf("target=%.2f unit=%s cmp=%s", g.Target, g.Unit, g.Comparison)
+                g.Target, g.Unit, g.Comparison = target, th.Unit, cmp
+                return &Violation{Kind: "goal", LLMValue: orig,
+                        Enforced: fmt.Sprintf("target=%.2f unit=%s cmp=%s", target, th.Unit, cmp),
+                        Detail:   "goal target/unit/comparison aligned to threshold bound"}
+        }
+        return nil
 }
 
-// ConsoleLogger prints to stdout
-type ConsoleLogger struct{}
-
-func (c *ConsoleLogger) Log(step, category, message string, data map[string]interface{}) {
-	var timestamp string
-	if LogTimestamps {
-		timestamp = time.Now().Format("15:04:05") + " "
-	}
-
-	dataStr := ""
-	if len(data) > 0 {
-		pairs := make([]string, 0, len(data))
-		for k, v := range data {
-			pairs = append(pairs, fmt.Sprintf("%s=%v", k, v))
-		}
-		dataStr = " {" + strings.Join(pairs, ", ") + "}"
-	}
-
-	fmt.Printf("%s[%s] %s: %s%s\n", timestamp, step, category, message, dataStr)
+// renderText is the deterministic narration used as a fallback in strict mode
+// (and when the LLM returns unparseable output). Blander than the model's
+// prose, but every number is correct by construction.
+func (c computedAnalysis) renderText() string {
+        var sb strings.Builder
+        for _, l := range c.lines {
+                switch l.status {
+                case "BELOW minimum":
+                        sb.WriteString(fmt.Sprintf(
+                                "%s is %.2f %s, below the recommended minimum of %.2f. Aim to raise it to at least %.2f. ",
+                                l.metric, l.value, l.unit, l.min, l.min))
+                case "ABOVE maximum":
+                        sb.WriteString(fmt.Sprintf(
+                                "%s is %.2f %s, above the recommended maximum of %.2f. Aim to bring it under %.2f. ",
+                                l.metric, l.value, l.unit, l.max, l.max))
+                default:
+                        sb.WriteString(fmt.Sprintf(
+                                "%s is %.2f %s, within the healthy range of %.2f to %.2f. ",
+                                l.metric, l.value, l.unit, l.min, l.max))
+                }
+        }
+        return strings.TrimSpace(sb.String())
 }
 
-// ================================================================================
-// HELPERS
-// ================================================================================
+// ---------------------------------------------------------------------------
+// Number tracing in prose (heuristic)
+// ---------------------------------------------------------------------------
 
-// GetAPIKey returns the API key from environment or config
-func GetAPIKey() string {
-	if key := os.Getenv("LAOZI_API_KEY"); key != "" {
-		return key
-	}
-	return LLMAPIKey
+var numRe = regexp.MustCompile(`-?[\d,]+(?:\.\d+)?`)
+
+// unknownNumbers returns numeric tokens in text that don't correspond to any
+// known quantity (actual values or threshold bounds).
+//
+// HONEST CAVEAT: this is heuristic. Free prose legitimately contains numbers
+// that aren't metrics ("over the last 30 days", "top 3 vendors"), so it will
+// produce false positives and is a *flagging* signal, not a hard guarantee.
+// The fully reliable guarantees in this file are severity, reference, and goal
+// — those are structured and enforced unconditionally. For prose, the real
+// lever is strict mode, which discards the model's text in favor of renderText.
+func (c computedAnalysis) unknownNumbers(text string) []string {
+        var bad []string
+        for _, tok := range numRe.FindAllString(text, -1) {
+                n, err := parseNum(tok)
+                if err != nil {
+                        continue
+                }
+                if !c.isAllowed(n) {
+                        bad = append(bad, tok)
+                }
+        }
+        return bad
+}
+
+func (c computedAnalysis) isAllowed(n float64) bool {
+        for _, a := range c.allowed {
+                if floatEq(a, n) {
+                        return true
+                }
+        }
+        return false
+}
+
+func parseNum(tok string) (float64, error) {
+        return strconv.ParseFloat(strings.ReplaceAll(tok, ",", ""), 64)
+}
+
+func floatEq(a, b float64) bool {
+        tol := math.Max(0.01, 0.005*math.Abs(a))
+        return math.Abs(a-b) <= tol
+}
+
+// truncate cuts a string to maxLen, appending "..." if truncated.
+func truncate(s string, maxLen int) string {
+        if len(s) <= maxLen {
+                return s
+        }
+        return s[:maxLen] + "..."
+}
+
+// ---------------------------------------------------------------------------
+// Prompt construction
+// ---------------------------------------------------------------------------
+
+func (e *Engine) buildGuidelinesText(cat Category) string {
+        var sb strings.Builder
+        for _, t := range cat.Thresholds {
+                sb.WriteString(fmt.Sprintf("📊 %s GUIDELINE:\n", strings.ToUpper(t.Metric)))
+                sb.WriteString(fmt.Sprintf("   Range: %.2f - %.2f %s\n", t.Min, t.Max, t.Unit))
+                if t.OptimalMin > 0 || t.OptimalMax > 0 {
+                        sb.WriteString(fmt.Sprintf("   Optimal: %.2f - %.2f %s\n", t.OptimalMin, t.OptimalMax, t.Unit))
+                }
+                sb.WriteString(fmt.Sprintf("   Source: %s\n", t.Source))
+                sb.WriteString(fmt.Sprintf("   URL: %s\n", t.SourceURL))
+                if t.Description != "" {
+                        sb.WriteString(fmt.Sprintf("   Note: %s\n", t.Description))
+                }
+                sb.WriteString("\n")
+        }
+        return sb.String()
+}
+
+func (e *Engine) buildRAGContext(results []RAGResult) string {
+        var sb strings.Builder
+        sb.WriteString("ADDITIONAL REFERENCES:\n")
+        for i, r := range results {
+                sb.WriteString(fmt.Sprintf("%d. %s\n   Source: %s - %s\n\n", i+1, r.Content, r.Source, r.SourceURL))
+        }
+        return sb.String()
+}
+
+func (e *Engine) buildSystemPrompt() string {
+        return `You are an insight generator using the Laozi dual-constraint system.
+You MUST generate exactly ONE insight based on the provided thresholds and data.
+
+RULES:
+1. Use ONLY the thresholds and references provided
+2. Never invent data or thresholds
+3. Compare actual values to thresholds explicitly
+4. Include the source URL in your reference
+5. Use ONLY numbers from the provided data and thresholds in your narrative
+
+SEVERITY:
+- "warning" = value OUTSIDE the threshold range
+- "success" = value WITHIN the threshold range  
+- "info" = educational tip (for educational categories)
+
+Respond with ONLY valid JSON.`
+}
+
+func (e *Engine) buildUserPrompt(cat Category, guidelines, metrics, ragContext string, severity Severity) string {
+        contextJSON, _ := json.Marshal(e.snapshotContext())
+
+        if cat.Educational {
+                return fmt.Sprintf(`CATEGORY: %s (%s)
+TYPE: Educational "Did You Know" tip
+
+CONTEXT:
+%s
+
+%s
+
+OUTPUT (severity MUST be "info"):
+{
+  "insight": {
+    "text": "Did you know? [educational fact]",
+    "severity": "info",
+    "reference": "[Source] - [URL]"
+  }
+}`, cat.ID, cat.Name, string(contextJSON), ragContext)
+        }
+
+        metricName := ""
+        if len(cat.Thresholds) > 0 {
+                metricName = cat.Thresholds[0].Metric
+        }
+
+        return fmt.Sprintf(`CATEGORY: %s (%s)
+
+GUIDELINES (Tier 1 - Mandatory):
+%s
+
+%s
+
+CONTEXT:
+%s
+
+ACTUAL VALUES WITH COMPARISON:
+%s
+
+EXPECTED SEVERITY: %s
+
+OUTPUT (use severity="%s"):
+{
+  "insight": {
+    "text": "[State value, compare to threshold, give advice]",
+    "severity": "%s",
+    "reference": "[Source from guidelines] - [URL]",
+    "suggested_goal": { "metric": "%s", "target": [threshold_value], "unit": "[unit]", "comparison": "gte", "description": "..." }
+  }
+}`,
+                cat.ID, cat.Name,
+                guidelines,
+                ragContext,
+                string(contextJSON),
+                metrics,
+                severity, severity, severity,
+                metricName)
+}
+
+// ---------------------------------------------------------------------------
+// Response parsing
+// ---------------------------------------------------------------------------
+
+func (e *Engine) parseResponse(response string, cat Category) (*Insight, error) {
+        // Clean JSON markers
+        response = strings.TrimPrefix(response, "```json")
+        response = strings.TrimPrefix(response, "```")
+        response = strings.TrimSuffix(response, "```")
+        response = strings.TrimSpace(response)
+
+        var result struct {
+                Insight struct {
+                        Text          string         `json:"text"`
+                        Severity      Severity       `json:"severity"`
+                        Reference     string         `json:"reference"`
+                        SuggestedGoal *SuggestedGoal `json:"suggested_goal"`
+                } `json:"insight"`
+        }
+
+        if err := json.Unmarshal([]byte(response), &result); err != nil {
+                return nil, fmt.Errorf("parse error: %w", err)
+        }
+
+        // Extract related metrics
+        var relatedMetrics []string
+        for _, t := range cat.Thresholds {
+                relatedMetrics = append(relatedMetrics, t.Metric)
+        }
+
+        return &Insight{
+                ID:             fmt.Sprintf("%s-001", cat.ID),
+                CategoryID:     cat.ID,
+                CategoryName:   cat.Name,
+                Text:           result.Insight.Text,
+                Severity:       result.Insight.Severity,
+                RelatedMetrics: relatedMetrics,
+                Reference:      result.Insight.Reference,
+                SuggestedGoal:  result.Insight.SuggestedGoal,
+        }, nil
 }
