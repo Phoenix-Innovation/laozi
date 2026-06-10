@@ -5,10 +5,13 @@
 //
 // Run:   cd src && go run ./cmd/demo      then open http://localhost:8080
 //
-// It runs fully offline: demoLLM stands in for a real model and deliberately
-// returns a wrong severity, a bogus citation, and an invented number so the
-// enforcement layer's corrections are visible. For a real model, swap demoLLM
-// for laozi.NewDefaultLLMClient() and set LAOZI_API_KEY.
+// It runs fully offline: demoLLM stands in for a real model. It narrates the
+// real reading and recommended range, but deliberately claims the wrong
+// severity, cites an unverified source, and adds one fabricated target figure —
+// so the enforcement layer's corrections (severity, citation, untraceable
+// number) are visible. For a real model, swap demoLLM for
+// laozi.NewDefaultLLMClient() and set LAOZI_API_KEY.
+
 package main
 
 import (
@@ -17,15 +20,44 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
+	"strconv"
 
 	laozi "github.com/Phoenix-Innovation/laozi"
 )
 
-// demoLLM misbehaves on purpose so enforcement has something to correct.
+// demoLLM misbehaves on purpose so enforcement has something to correct. It
+// reads the prompt and narrates the REAL reading and the REAL recommended range
+// (both traceable), but (a) always claims "success", (b) cites an unverified
+// source, and (c) adds one plausible-but-fabricated "target" figure that isn't
+// in the data. The engine then corrects the severity, replaces the citation
+// with a registered/RAG source, and flags the fabricated figure (replacing the
+// whole narration in strict mode).
 type demoLLM struct{}
 
-func (demoLLM) Chat(_ context.Context, _, _ string) (string, error) {
-	return `{"insight":{"text":"Your reading of 999 is comfortably within the normal healthy range.","severity":"success","reference":"Unverified Blog - https://made-up.example/post"}}`, nil
+// cmpRe matches the engine's comparison line, e.g.
+//   - fasting_glucose: 108.00 mg/dL → ABOVE maximum (70.00 - 99.00)
+var cmpRe = regexp.MustCompile(`- (\S+): ([\d.]+) (\S+) → .*? \(([\d.]+) - ([\d.]+)\)`)
+
+func (demoLLM) Chat(_ context.Context, _, user string) (string, error) {
+	text := "Keeping each measurement within its recommended range supports long-term health."
+	if m := cmpRe.FindStringSubmatch(user); m != nil {
+		metric, val, unit, loStr, hiStr := m[1], m[2], m[3], m[4], m[5]
+		lo, _ := strconv.ParseFloat(loStr, 64)
+		hi, _ := strconv.ParseFloat(hiStr, 64)
+		mid := (lo + hi) / 2 // realistic, but not the actual value or a bound → untraceable
+		text = fmt.Sprintf(
+			"Your %s reading is %s %s, against the recommended range of %s–%s %s. A reasonable personal target is around %.1f %s.",
+			metric, val, unit, loStr, hiStr, unit, mid, unit)
+	}
+	resp, _ := json.Marshal(map[string]interface{}{
+		"insight": map[string]interface{}{
+			"text":      text,
+			"severity":  "success", // deliberately wrong; enforced to the computed severity
+			"reference": "Unverified Blog - https://made-up.example/post",
+		},
+	})
+	return string(resp), nil
 }
 
 type app struct {

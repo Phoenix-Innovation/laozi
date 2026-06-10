@@ -1,5 +1,6 @@
 package main
 
+
 // indexHTML is the single-page UI, served at "/". Vanilla JS, no external
 // resources, so the demo works fully offline.
 const indexHTML = `<!doctype html>
@@ -63,7 +64,7 @@ const indexHTML = `<!doctype html>
 
   <section class="card">
     <h2>1 &middot; Analyze + Enforcement</h2>
-    <p class="sub">The demo model claims everything is "success", cites a fake URL, and invents the number 999. Watch severity, citation, and number get enforced. Toggle strict mode to replace invented numbers in prose.</p>
+    <p class="sub">The demo model narrates the real reading and recommended range, but claims everything is "success", cites an unverified source, and adds a fabricated "target" figure. Watch severity and citation get enforced and the untraceable figure get flagged. Toggle strict mode to replace the prose with a deterministic statement.</p>
     <div class="row">
       <div><label>steps</label><input id="m_steps" type="number" value="5200"></div>
       <div><label>fasting_glucose</label><input id="m_glucose" type="number" value="108"></div>
@@ -95,13 +96,13 @@ const indexHTML = `<!doctype html>
   <section class="card">
     <h2>3 &middot; DSL Test Parser</h2>
     <p class="sub">Validate a Laozi expression and see the compiled SQL, or the syntax/semantic errors.</p>
-    <textarea id="expr">SUM(amount) WHERE(type = 'income') OVER(30 days)</textarea>
+    <textarea id="expr">AVG(steps) OVER(7 days)</textarea>
     <div class="samples">
-      <button onclick="setExpr('COUNT(*) WHERE(type = \'CREDIT\') PERIOD(YTD)')">count YTD</button>
-      <button onclick="setExpr('GINI(amount GROUP_BY(payee))')">gini</button>
-      <button onclick="setExpr('CHANGE(revenue, 3 months)')">change</button>
-      <button onclick="setExpr('SUM(amount')">broken</button>
-      <button onclick="setExpr('GINI(amount)')">missing group_by</button>
+      <button onclick="setExpr('AVG(fasting_glucose) OVER(30 days)')">avg glucose 30d</button>
+      <button onclick="setExpr('COUNT(*) WHERE(steps > 10000) PERIOD(MTD)')">10k-step days MTD</button>
+      <button onclick="setExpr('STDEV(systolic_bp) OVER(90 days)')">BP variability</button>
+      <button onclick="setExpr('AVG(steps')">broken</button>
+      <button onclick="setExpr('GINI(steps)')">missing group_by</button>
     </div>
     <button onclick="checkDSL()">Check</button>
     <div id="dslOut" class="out"></div>
