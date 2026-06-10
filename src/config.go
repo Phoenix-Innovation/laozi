@@ -52,6 +52,10 @@ const (
 // WithConfig(Config{AutoApprove: true}).
 const RequireApproval = true
 
+// ClassifierHistoryWindow is how many recent conversation lines the Layer-1
+// LLM classifier sees for context. Consumed by Classifier.Classify (classifier.go).
+const ClassifierHistoryWindow = 4
+
 // InvalidPlaceholders are substrings that, if present in LLM output text,
 // indicate an unfilled template and fail validation. Consumed by Config.defaults.
 var InvalidPlaceholders = []string{
