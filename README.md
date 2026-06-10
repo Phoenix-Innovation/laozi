@@ -17,15 +17,7 @@ engine, not hopes about the prompt.
 
 ---
 
-## Repository layout & install
-
-The Go module lives in [`src/`](src/) (`module github.com/Phoenix-Innovation/laozi`).
-Examples are in [`Examples/`](Examples/).
-
-> **Note:** because `go.mod` is under `src/` rather than the repo root, a plain
-> `go get github.com/Phoenix-Innovation/laozi` will not resolve until the module is
-> moved to the repo root (or the import path is suffixed). For now, vendor the `src/`
-> package or use a local `replace` directive, as the example apps do.
+## Install
 
 ```go
 import laozi "github.com/Phoenix-Innovation/laozi"
