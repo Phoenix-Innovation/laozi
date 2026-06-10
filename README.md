@@ -17,7 +17,15 @@ engine, not hopes about the prompt.
 
 ---
 
-## Install
+## Repository layout & install
+
+The Go module lives in [`src/`](src/) (`module github.com/Phoenix-Innovation/laozi`).
+Examples are in [`Examples/`](Examples/).
+
+> **Note:** because `go.mod` is under `src/` rather than the repo root, a plain
+> `go get github.com/Phoenix-Innovation/laozi` will not resolve until the module is
+> moved to the repo root (or the import path is suffixed). For now, vendor the `src/`
+> package or use a local `replace` directive, as the example apps do.
 
 ```go
 import laozi "github.com/Phoenix-Innovation/laozi"
@@ -353,6 +361,88 @@ register proposals immediately (e.g. for trusted/automated pipelines).
 
 ---
 
+## Adaptive query classification (input side)
+
+Free-form user input is classified into one **domain** before any context is
+loaded, so analysis is limited to what that domain needs. Domains are fungible
+(they differ per market), so they're pluggable — in code or from a config file.
+
+The cascade has three layers with progressive fallback:
+
+1. **LLM classifier** — a low-temperature call returns one domain word; if it's a
+   specific domain (not the fallback), classification is done.
+2. **Keyword regex** — a deterministic safety net when the LLM is unsure.
+3. **Default** — the fallback domain (`general`).
+
+The LLM is optional: with no LLM client the classifier runs layers 2–3 only,
+which is fully deterministic.
+
+### Code-level domains (phase 1)
+
+```go
+clf := laozi.NewClassifier(
+    laozi.WithClassifierLLM(lowTempClient), // optional; omit for keyword-only
+    laozi.WithDomains([]laozi.Domain{
+        {
+            Name:        "financial_analysis",
+            Description: "expenses, revenue, cash flow, margins",
+            Keywords:    []string{"expense", "revenue", "cash flow", "margin"},
+            Categories:  []string{"liquidity", "profitability"}, // context to limit to
+        },
+        {
+            Name:        "transaction_clarification",
+            Description: "payments and transfers to payees",
+            Keywords:    []string{"payment", "transfer", "venmo", "vendor"},
+            Categories:  []string{"transactions"},
+        },
+    }),
+)
+
+cls := clf.Classify(ctx, "our operating margin slipped this quarter", history)
+// cls.Domain == "financial_analysis", cls.Layer == 1|2
+
+// Limit analysis to the classified domain's categories:
+d, _ := clf.Domain(cls.Domain)
+insights, _ := engine.AnalyzeSelected(ctx, d.Categories, metrics)
+```
+
+### Config file (documented YAML subset)
+
+```go
+spec, err := laozi.LoadDomainsFile("domains.yaml")
+clf := laozi.NewClassifier(laozi.WithSpec(spec), laozi.WithClassifierLLM(client))
+```
+
+```yaml
+# domains.yaml  (see domains.example.yaml)
+fallback: general
+domains:
+  - name: financial_analysis
+    description: Expenses, revenue, cash flow, margins
+    keywords: [expense, revenue, "cash flow", profit, margin]
+    categories: [liquidity, profitability]
+    actions: [confirm, reclassify]
+    max_tokens: 800
+```
+
+> The loader (`LoadDomains`/`LoadDomainsFile`) parses an intentionally small,
+> documented YAML subset with no third-party dependency: top-level `fallback:`
+> and `domains:`, list items beginning `- name:`, scalar fields, and inline
+> `[a, b, "c d"]` lists; `#` and blank lines are skipped, inline trailing
+> comments are not supported. For arbitrary YAML, unmarshal into `[]laozi.Domain`
+> with your own library — the struct carries both `json` and `yaml` tags.
+
+### Spec
+
+A `Domain` is: `Name` (the resolved category word), `Description` (shown to the
+LLM classifier), `Keywords` (layer-2 matchers), `Categories` (IDs to limit
+analysis to), and optional `SystemPrompt`, `Actions`, and `MaxTokens` for a
+domain-tuned pipeline. `Classify` returns `{Domain, Layer, Reason}`. The LLM
+classifier sees the last `ClassifierHistoryWindow` (config default 4) conversation
+lines.
+
+---
+
 ## Output structures
 
 ```go
@@ -401,7 +491,7 @@ go vet ./...
 go test -race ./...    # full suite under the race detector
 ```
 
-The suite (28 test functions, plus subtables) covers:
+The suite (39 test functions, plus subtables) covers:
 
 - **DSL** — `TestDSLAllFunctions` is a per-function conformance table (every function,
   keyword, named period, and unit, with a coverage guard against the function registry),
@@ -412,6 +502,9 @@ The suite (28 test functions, plus subtables) covers:
   `-race` parallel stress test.
 - **Draft/approval** — propose-creates-draft-not-registered, approve-promotes,
   reject-never-promotes, invalid-DSL-blocked, reviewer hook, auto-approve, JSON round-trip.
+- **Classification** — the three-layer cascade (LLM hit, regex fallback, default,
+  LLM-error degradation, no-LLM determinism), the YAML-subset loader (parse +
+  error cases), and `AnalyzeSelected` context-limiting.
 - **Retry/regeneration**, **RAG**, and a runnable doc `Example`.
 
 ---
