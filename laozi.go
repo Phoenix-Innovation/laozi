@@ -41,6 +41,7 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -185,6 +186,7 @@ type Engine struct {
 	drafts     map[string]*Draft
 	nextDraft  int
 	reviewer   Reviewer
+	audit      AuditSink
 }
 
 // New creates a new Laozi engine.
@@ -322,7 +324,24 @@ func (e *Engine) AnalyzeCategory(ctx context.Context, categoryID string, metrics
 // Core pipeline: compute → LLM → parse → enforce → validate → retry
 // ---------------------------------------------------------------------------
 
+// analyzeCategory runs the per-category pipeline and emits one audit event for
+// the produced insight (covering Analyze, AnalyzeCategory, and AnalyzeSelected).
 func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
+	ins, err := e.analyzeCategoryInner(ctx, cat, metrics)
+	if err == nil && ins != nil {
+		e.emitAudit(ctx, AuditEvent{
+			Time:       time.Now(),
+			Kind:       "analysis",
+			CategoryID: cat.ID,
+			Metrics:    metrics,
+			Insight:    ins,
+			Strict:     e.strict,
+		})
+	}
+	return ins, err
+}
+
+func (e *Engine) analyzeCategoryInner(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
 	// Step 1: Deterministic ground truth.
 	comp := computeAnalysis(cat, metrics)
 

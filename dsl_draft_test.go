@@ -115,7 +115,7 @@ func dslCategory() Category {
 
 func TestProposeCreatesDraftNotRegistered(t *testing.T) {
 	e := New(WithLLM(mockLLM{resp: `{}`}))
-	d, err := e.ProposeCategory(dslCategory())
+	d, err := e.ProposeCategory(dslCategory(), "tester")
 	if err != nil {
 		t.Fatalf("propose: %v", err)
 	}
@@ -137,8 +137,8 @@ func TestProposeCreatesDraftNotRegistered(t *testing.T) {
 
 func TestApprovePromotesToProduction(t *testing.T) {
 	e := New(WithLLM(mockLLM{resp: `{"insight":{"text":"monthly_revenue is within the target band.","severity":"success","reference":"Benchmark - https://bench/x"}}`}))
-	d, _ := e.ProposeCategory(dslCategory())
-	if err := e.ApproveDraft(d.ID); err != nil {
+	d, _ := e.ProposeCategory(dslCategory(), "tester")
+	if err := e.ApproveDraft(d.ID, "approver"); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	if got, _ := e.Draft(d.ID); got.Status != StatusApproved {
@@ -159,8 +159,8 @@ func TestApprovePromotesToProduction(t *testing.T) {
 
 func TestRejectNeverPromotes(t *testing.T) {
 	e := New(WithLLM(mockLLM{resp: `{}`}))
-	d, _ := e.ProposeCategory(dslCategory())
-	if err := e.RejectDraft(d.ID, "thresholds look wrong"); err != nil {
+	d, _ := e.ProposeCategory(dslCategory(), "tester")
+	if err := e.RejectDraft(d.ID, "rejecter", "thresholds look wrong"); err != nil {
 		t.Fatalf("reject: %v", err)
 	}
 	if got, _ := e.Draft(d.ID); got.Status != StatusRejected || got.RejectReason == "" {
@@ -170,7 +170,7 @@ func TestRejectNeverPromotes(t *testing.T) {
 		t.Error("rejected category must never be analyzable")
 	}
 	// Approving a rejected draft must fail.
-	if err := e.ApproveDraft(d.ID); err == nil {
+	if err := e.ApproveDraft(d.ID, "approver"); err == nil {
 		t.Error("approving a rejected draft should fail")
 	}
 }
@@ -179,7 +179,7 @@ func TestProposeRejectsInvalidDSL(t *testing.T) {
 	e := New(WithLLM(mockLLM{resp: `{}`}))
 	cat := dslCategory()
 	cat.Thresholds[0].Expression = `SUM(amount` // syntax error
-	d, err := e.ProposeCategory(cat)
+	d, err := e.ProposeCategory(cat, "tester")
 	if err == nil {
 		t.Fatal("expected error for invalid DSL")
 	}
@@ -198,7 +198,7 @@ func (c *capturingReviewer) OnDraft(d *Draft) { c.got = append(c.got, d) }
 func TestReviewerHookFires(t *testing.T) {
 	rv := &capturingReviewer{}
 	e := New(WithLLM(mockLLM{resp: `{}`}), WithReviewer(rv))
-	d, _ := e.ProposeCategory(dslCategory())
+	d, _ := e.ProposeCategory(dslCategory(), "tester")
 	if len(rv.got) != 1 || rv.got[0].ID != d.ID {
 		t.Errorf("reviewer should be notified once with the new draft, got %+v", rv.got)
 	}
@@ -206,7 +206,7 @@ func TestReviewerHookFires(t *testing.T) {
 
 func TestAutoApproveSkipsGate(t *testing.T) {
 	e := New(WithLLM(mockLLM{resp: `{"insight":{"text":"monthly_revenue is within the target band.","severity":"success","reference":"Benchmark - https://bench/x"}}`}), WithConfig(Config{AutoApprove: true}))
-	d, err := e.ProposeCategory(dslCategory())
+	d, err := e.ProposeCategory(dslCategory(), "tester")
 	if err != nil {
 		t.Fatalf("propose: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestAutoApproveSkipsGate(t *testing.T) {
 func TestDraftIsJSONSerializable(t *testing.T) {
 	// The host app renders the draft, so it must round-trip through JSON.
 	e := New(WithLLM(mockLLM{resp: `{}`}))
-	d, _ := e.ProposeCategory(dslCategory())
+	d, _ := e.ProposeCategory(dslCategory(), "tester")
 	b, err := json.Marshal(d)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

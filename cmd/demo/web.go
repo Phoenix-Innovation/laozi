@@ -1,6 +1,5 @@
 package main
 
-
 // indexHTML is the single-page UI, served at "/". Vanilla JS, no external
 // resources, so the demo works fully offline.
 const indexHTML = `<!doctype html>
@@ -126,6 +125,12 @@ const indexHTML = `<!doctype html>
     <button class="ghost" onclick="loadDrafts()">Refresh pending</button>
     <div id="draftOut" class="out"></div>
   </section>
+  <section class="card wide">
+    <h2>5 &middot; Durable Audit Log <span class="pill" id="auditIntact"></span></h2>
+    <p class="sub">Every enforced insight and every human draft decision (who + when) is written to an append-only, hash-chained audit sink. This is the durable, tamper-evident trail — a real host swaps the in-memory sink for Postgres/object-store via the <code>AuditSink</code> interface.</p>
+    <button class="ghost" onclick="loadAudit()">Refresh audit log</button>
+    <div id="auditOut" class="out"></div>
+  </section>
 
 </main>
 <script>
@@ -162,7 +167,7 @@ function analyze(){
   post("/api/analyze", {metrics:metrics, strict:document.getElementById("strict").checked}).then(function(r){
     var el = document.getElementById("analyzeOut");
     if(r.error){ el.innerHTML = "<div class='err'>"+esc(r.error)+"</div>"; return; }
-    el.innerHTML = (r.insights||[]).map(renderInsight).join("");
+    el.innerHTML = (r.insights||[]).map(renderInsight).join(""); loadAudit();
   });
 }
 
@@ -207,7 +212,7 @@ function propose(){
     Min:num("d_min"), Max:num("d_max"), Unit:val("d_unit"), Source:"Demo", SourceURL:"https://demo.example/guide"}).then(function(r){
     var el = document.getElementById("draftOut");
     if(r.error){ el.innerHTML = "<div class='err'>"+esc(r.error)+"</div>"; return; }
-    el.innerHTML = "<div class='ok'>proposed &mdash; pending approval</div>" + renderDraft(r.draft);
+    el.innerHTML = "<div class='ok'>proposed &mdash; pending approval</div>" + renderDraft(r.draft); loadAudit();
   });
 }
 function loadDrafts(){
@@ -218,11 +223,30 @@ function loadDrafts(){
   });
 }
 function approve(id){ post("/api/approve",{ID:id}).then(function(r){
-  document.getElementById("draftOut").innerHTML = r.error ? "<div class='err'>"+esc(r.error)+"</div>" : "<div class='ok'>approved &amp; registered for analysis &check;</div>";
+  document.getElementById("draftOut").innerHTML = r.error ? "<div class='err'>"+esc(r.error)+"</div>" : "<div class='ok'>approved &amp; registered for analysis &check;</div>"; loadAudit();
 }); }
-function reject(id){ post("/api/reject",{ID:id, Reason:"rejected from demo"}).then(function(){ loadDrafts(); }); }
+function reject(id){ post("/api/reject",{ID:id, Reason:"rejected from demo"}).then(function(){ loadDrafts(); loadAudit(); }); }
+
+function loadAudit(){
+  fetch("/api/audit").then(function(r){return r.json();}).then(function(r){
+    document.getElementById("auditIntact").textContent = r.intact ? "chain intact" : "TAMPERED";
+    var es = (r.entries||[]);
+    var h = es.slice().reverse().map(function(e){
+      var s = "<div class='insight'><b>"+esc(e.kind)+"</b>";
+      if(e.actor){ s += " <span class='pill'>by "+esc(e.actor)+"</span>"; }
+      s += " <span class='ref'>"+esc((e.time||"").replace("T"," ").slice(0,19))+"</span>";
+      if(e.category_id){ s += "<div class='ref'>category: "+esc(e.category_id)+"</div>"; }
+      if(e.insight){ s += "<div class='ref'>severity: "+esc(e.insight.severity)+" &middot; violations: "+((e.insight.violations||[]).length)+"</div>"; }
+      if(e.detail){ s += "<div class='ref'>"+esc(e.detail)+"</div>"; }
+      s += "<div class='ref'>hash: "+esc((e.hash||"").slice(0,16))+"…</div></div>";
+      return s;
+    }).join("");
+    document.getElementById("auditOut").innerHTML = h || "<div class='sub'>no audit entries yet</div>";
+  });
+}
 
 analyze();
+loadAudit();
 </script>
 </body>
 </html>`

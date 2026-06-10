@@ -1,0 +1,24 @@
+# Laozi domain classifier config (documented YAML subset).
+# Load with: spec, _ := laozi.LoadDomainsFile("domains.yaml")
+#            clf := laozi.NewClassifier(laozi.WithSpec(spec), laozi.WithClassifierLLM(llm))
+fallback: general
+domains:
+  - name: financial_analysis
+    description: Expenses, revenue, cash flow, profit, and margins
+    keywords: [expense, revenue, "cash flow", profit, margin]
+    categories: [liquidity, profitability]
+    system_prompt: Analyze financial metrics conservatively against the registered thresholds.
+    actions: [confirm, reclassify]
+    max_tokens: 800
+  - name: transaction_clarification
+    description: Payments and transfers to payees and vendors
+    keywords: [payment, transfer, zelle, venmo, paypal, vendor]
+    categories: [transactions]
+    actions: [whitelist, reclassify, confirm, ignore]
+    max_tokens: 800
+  - name: entity_structure
+    description: Ownership, partners, members, and legal entity structure
+    keywords: [partner, member, owner, LLC, "S-Corp", ownership]
+    categories: [ownership]
+    actions: [define_partners, update_entity_type, confirm]
+    max_tokens: 600

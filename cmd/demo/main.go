@@ -11,7 +11,6 @@
 // so the enforcement layer's corrections (severity, citation, untraceable
 // number) are visible. For a real model, swap demoLLM for
 // laozi.NewDefaultLLMClient() and set LAOZI_API_KEY.
-
 package main
 
 import (
@@ -64,6 +63,7 @@ type app struct {
 	rag         *laozi.InMemoryRAG
 	classifier  *laozi.Classifier
 	draftEngine *laozi.Engine // persistent, for the draft/approval demo + classification
+	audit       *laozi.MemoryAuditSink
 }
 
 func baseCategories() []laozi.Category {
@@ -124,6 +124,7 @@ func (a *app) newEngine(strict bool) *laozi.Engine {
 		laozi.WithLLM(demoLLM{}),
 		laozi.WithRAG(a.rag),
 		laozi.WithStrict(strict),
+		laozi.WithAuditSink(a.audit),
 		laozi.WithContext("patient", map[string]interface{}{"age": 45, "gender": "male"}),
 	)
 	e.AddCategories(baseCategories())
@@ -207,12 +208,15 @@ func (a *app) handleDrafts(w http.ResponseWriter, r *http.Request) {
 // POST /api/propose  {name, metric, expression, min, max, unit, source, sourceUrl} -> {draft} | {error}
 func (a *app) handlePropose(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name, Metric, Expression, Unit, Source, SourceURL string
-		Min, Max                                          float64
+		Name, Metric, Expression, Unit, Source, SourceURL, Actor string
+		Min, Max                                                 float64
 	}
 	if err := decode(r, &req); err != nil {
 		writeJSON(w, map[string]interface{}{"error": err.Error()})
 		return
+	}
+	if req.Actor == "" {
+		req.Actor = "demo-author"
 	}
 	cat := laozi.Category{
 		ID: req.Name, Name: req.Name,
@@ -222,7 +226,7 @@ func (a *app) handlePropose(w http.ResponseWriter, r *http.Request) {
 			Source: req.Source, SourceURL: req.SourceURL,
 		}},
 	}
-	d, err := a.draftEngine.ProposeCategory(cat)
+	d, err := a.draftEngine.ProposeCategory(cat, req.Actor)
 	if err != nil {
 		writeJSON(w, map[string]interface{}{"error": err.Error()})
 		return
@@ -232,9 +236,12 @@ func (a *app) handlePropose(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/approve {id} ; POST /api/reject {id, reason}
 func (a *app) handleApprove(w http.ResponseWriter, r *http.Request) {
-	var req struct{ ID string }
+	var req struct{ ID, Actor string }
 	_ = decode(r, &req)
-	if err := a.draftEngine.ApproveDraft(req.ID); err != nil {
+	if req.Actor == "" {
+		req.Actor = "demo-reviewer"
+	}
+	if err := a.draftEngine.ApproveDraft(req.ID, req.Actor); err != nil {
 		writeJSON(w, map[string]interface{}{"error": err.Error()})
 		return
 	}
@@ -242,13 +249,21 @@ func (a *app) handleApprove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleReject(w http.ResponseWriter, r *http.Request) {
-	var req struct{ ID, Reason string }
+	var req struct{ ID, Actor, Reason string }
 	_ = decode(r, &req)
-	if err := a.draftEngine.RejectDraft(req.ID, req.Reason); err != nil {
+	if req.Actor == "" {
+		req.Actor = "demo-reviewer"
+	}
+	if err := a.draftEngine.RejectDraft(req.ID, req.Actor, req.Reason); err != nil {
 		writeJSON(w, map[string]interface{}{"error": err.Error()})
 		return
 	}
 	writeJSON(w, map[string]interface{}{"ok": true})
+}
+
+// GET /api/audit -> {entries, intact}  (durable, hash-chained audit log)
+func (a *app) handleAudit(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]interface{}{"entries": a.audit.Entries(), "intact": a.audit.Verify()})
 }
 
 func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -261,7 +276,7 @@ func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	a := &app{rag: laozi.NewInMemoryRAG(), classifier: laozi.NewClassifier(laozi.WithDomains(classifierDomains()))}
+	a := &app{rag: laozi.NewInMemoryRAG(), classifier: laozi.NewClassifier(laozi.WithDomains(classifierDomains())), audit: laozi.NewMemoryAuditSink()}
 	a.seedRAG()
 	a.draftEngine = a.newEngine(false)
 
@@ -274,6 +289,7 @@ func main() {
 	mux.HandleFunc("/api/propose", a.handlePropose)
 	mux.HandleFunc("/api/approve", a.handleApprove)
 	mux.HandleFunc("/api/reject", a.handleReject)
+	mux.HandleFunc("/api/audit", a.handleAudit)
 
 	addr := "localhost:8080"
 	log.Printf("Laozi demo running at http://%s  (Ctrl+C to stop)", addr)

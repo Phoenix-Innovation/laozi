@@ -17,7 +17,15 @@ engine, not hopes about the prompt.
 
 ---
 
-## Install
+## Repository layout & install
+
+The Go module is at the repo root (`module github.com/Phoenix-Innovation/laozi`).
+The demo command is in [`cmd/demo/`](cmd/demo/) and example apps in
+[`Examples/`](Examples/); both build as part of the module.
+
+```bash
+go get github.com/Phoenix-Innovation/laozi
+```
 
 ```go
 import laozi "github.com/Phoenix-Innovation/laozi"
@@ -435,6 +443,48 @@ lines.
 
 ---
 
+## Durable audit
+
+Laozi computes the auditable facts — the enforced severity/citation/number
+corrections (`Insight.Violations`) and the human draft decisions — but it does
+**not** pick a datastore. Persistence is implementation-dependent: a host plugs
+an `AuditSink` over Postgres, an append-only log, an object store, Kafka, a WORM
+bucket, etc. (the same pattern as `RAGStore`).
+
+```go
+type AuditSink interface {
+    Record(ctx context.Context, e AuditEvent) error // MUST be concurrency-safe
+}
+
+engine := laozi.New(laozi.WithLLM(client), laozi.WithAuditSink(mySink))
+```
+
+An `AuditEvent` is one record, discriminated by `Kind`:
+
+- `analysis` — an enforced insight (carries the `Insight`, including `Violations`, plus the metrics and strict flag). Emitted for every category from `Analyze`/`AnalyzeCategory`/`AnalyzeSelected`.
+- `draft_proposed` / `draft_approved` / `draft_rejected` — the human validation loop, each with **`Actor` (who)** and **`Time` (when)**. The `Draft` itself also records `CreatedBy`/`CreatedAt` and `DecidedBy`/`DecidedAt`.
+
+The draft methods take the actor explicitly:
+
+```go
+d, _ := engine.ProposeCategory(cat, "alice")   // who proposed
+engine.ApproveDraft(d.ID, "bob")               // who approved (registers the category)
+engine.RejectDraft(d.ID, "carol", "reason")    // who rejected
+```
+
+A reference sink, `MemoryAuditSink`, ships in the box: an in-process,
+append-only, **hash-chained** log (each entry's hash covers the prior entry, so
+any later edit breaks the chain — `Verify()` detects it). It is not durable
+across restarts; it demonstrates the seam, powers the demo's audit panel, and
+its chaining can be reused by a real durable sink for tamper-evidence.
+
+> Audit emit is fire-and-forget: a transient sink error does not fail an insight
+> or an approval. Hosts needing audit-before-ack implement that inside `Record`
+> (durable write, retry, dead-letter). The `Draft` and returned `Insight` still
+> carry the record in-process regardless.
+
+---
+
 ## Output structures
 
 ```go
@@ -474,10 +524,30 @@ state is guarded by a `sync.RWMutex`. The suite includes a `-race` parallel stre
 
 ---
 
+## Demo app
+
+A self-contained web app exercises every core feature. It runs offline (a
+deliberately-misbehaving demo model stands in for a real LLM so you can watch
+the enforcement layer correct it):
+
+```bash
+go run ./cmd/demo      # then open http://localhost:8080
+```
+
+The single page covers: **Analyze + enforcement** (severity/citation/number
+corrections with the Violations audit trail, plus a strict-mode toggle that
+replaces invented numbers), **adaptive classification** (free-form input → domain
+→ context-limited analysis), the **DSL test parser** (validate an expression, see
+compiled SQL or errors), and the **human draft/approval loop** (propose a
+category with a DSL expression → review the draft + compiled SQL → approve). For
+a real model, swap `demoLLM` for `laozi.NewDefaultLLMClient()` and set
+`LAOZI_API_KEY`.
+
+---
+
 ## Testing
 
 ```bash
-cd src
 go build ./...
 go vet ./...
 go test -race ./...    # full suite under the race detector

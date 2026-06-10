@@ -1,6 +1,7 @@
 package laozi
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
@@ -41,8 +42,11 @@ type Draft struct {
 	Kind         string             `json:"kind"` // "category"
 	Status       Status             `json:"status"`
 	CreatedAt    time.Time          `json:"created_at"`
+	CreatedBy    string             `json:"created_by,omitempty"` // who proposed
 	Category     *Category          `json:"category,omitempty"`
 	Expressions  []ExpressionReview `json:"expressions,omitempty"`
+	DecidedAt    time.Time          `json:"decided_at,omitempty"` // when approved/rejected
+	DecidedBy    string             `json:"decided_by,omitempty"` // who approved/rejected
 	RejectReason string             `json:"reject_reason,omitempty"`
 }
 
@@ -97,7 +101,7 @@ func reviewExpressions(cat Category) (reviews []ExpressionReview, allValid bool)
 //     returned (the host should have called CheckExpression while editing).
 //   - If approval is disabled (AutoApprove), the category is registered
 //     immediately and the returned draft is already StatusApproved.
-func (e *Engine) ProposeCategory(cat Category) (*Draft, error) {
+func (e *Engine) ProposeCategory(cat Category, actor string) (*Draft, error) {
 	reviews, allValid := reviewExpressions(cat)
 	if !allValid {
 		var msgs []string
@@ -118,6 +122,7 @@ func (e *Engine) ProposeCategory(cat Category) (*Draft, error) {
 		Kind:        "category",
 		Status:      StatusDraft,
 		CreatedAt:   time.Now(),
+		CreatedBy:   actor,
 		Category:    &catCopy,
 		Expressions: reviews,
 	}
@@ -125,11 +130,22 @@ func (e *Engine) ProposeCategory(cat Category) (*Draft, error) {
 	auto := !e.approvalRequired()
 	if auto {
 		d.Status = StatusApproved
+		d.DecidedBy = actor
+		d.DecidedAt = time.Now()
 		e.categories[cat.ID] = cat // promote immediately
 	}
 	reviewer := e.reviewer
 	e.mu.Unlock()
 
+	e.emitAudit(context.Background(), AuditEvent{
+		Time: d.CreatedAt, Kind: "draft_proposed", Actor: actor, DraftID: id, CategoryID: cat.ID,
+	})
+	if auto {
+		e.emitAudit(context.Background(), AuditEvent{
+			Time: d.DecidedAt, Kind: "draft_approved", Actor: actor, DraftID: id, CategoryID: cat.ID,
+			Detail: "auto-approved (approval gate disabled)",
+		})
+	}
 	if reviewer != nil {
 		reviewer.OnDraft(d)
 	}
@@ -138,36 +154,58 @@ func (e *Engine) ProposeCategory(cat Category) (*Draft, error) {
 
 // ApproveDraft promotes a draft to production. For a category draft this
 // registers the category so Analyze will use it.
-func (e *Engine) ApproveDraft(id string) error {
+func (e *Engine) ApproveDraft(id, actor string) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	d, ok := e.drafts[id]
 	if !ok {
+		e.mu.Unlock()
 		return fmt.Errorf("draft not found: %s", id)
 	}
 	if d.Status != StatusDraft {
+		e.mu.Unlock()
 		return fmt.Errorf("draft %s is %s, not pending", id, d.Status)
 	}
 	d.Status = StatusApproved
+	d.DecidedBy = actor
+	d.DecidedAt = time.Now()
+	catID := ""
 	if d.Kind == "category" && d.Category != nil {
 		e.categories[d.Category.ID] = *d.Category
+		catID = d.Category.ID
 	}
+	e.mu.Unlock()
+
+	e.emitAudit(context.Background(), AuditEvent{
+		Time: time.Now(), Kind: "draft_approved", Actor: actor, DraftID: id, CategoryID: catID,
+	})
 	return nil
 }
 
 // RejectDraft marks a draft rejected; it is never promoted.
-func (e *Engine) RejectDraft(id, reason string) error {
+func (e *Engine) RejectDraft(id, actor, reason string) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	d, ok := e.drafts[id]
 	if !ok {
+		e.mu.Unlock()
 		return fmt.Errorf("draft not found: %s", id)
 	}
 	if d.Status != StatusDraft {
+		e.mu.Unlock()
 		return fmt.Errorf("draft %s is %s, not pending", id, d.Status)
 	}
 	d.Status = StatusRejected
+	d.DecidedBy = actor
+	d.DecidedAt = time.Now()
 	d.RejectReason = reason
+	catID := ""
+	if d.Category != nil {
+		catID = d.Category.ID
+	}
+	e.mu.Unlock()
+
+	e.emitAudit(context.Background(), AuditEvent{
+		Time: time.Now(), Kind: "draft_rejected", Actor: actor, DraftID: id, CategoryID: catID, Detail: reason,
+	})
 	return nil
 }
 
