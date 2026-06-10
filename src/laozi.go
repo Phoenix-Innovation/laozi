@@ -59,6 +59,7 @@ const (
 // Threshold defines a constraint for a metric.
 type Threshold struct {
 	Metric      string  `json:"metric"`
+	Expression  string  `json:"expression,omitempty"` // optional Laozi DSL; host compiles+runs it to produce Metric's value
 	Min         float64 `json:"min"`
 	Max         float64 `json:"max"`
 	OptimalMin  float64 `json:"optimal_min,omitempty"`
@@ -145,6 +146,7 @@ type Config struct {
 	MinTextLen   int      // minimum insight text length (0 = disabled)
 	Placeholders []string // substrings that invalidate LLM output
 	RAGTopK      int      // max results to retrieve per RAG search (default 3)
+	AutoApprove  bool     // skip the human draft/approval gate for DSL proposals (default false)
 }
 
 // defaults returns a Config with all zero-value fields replaced by defaults.
@@ -180,6 +182,9 @@ type Engine struct {
 	mu         sync.RWMutex
 	strict     bool
 	cfg        Config
+	drafts     map[string]*Draft
+	nextDraft  int
+	reviewer   Reviewer
 }
 
 // New creates a new Laozi engine.
@@ -187,6 +192,7 @@ func New(opts ...Option) *Engine {
 	e := &Engine{
 		categories: make(map[string]Category),
 		context:    make(map[string]interface{}),
+		drafts:     make(map[string]*Draft),
 	}
 	for _, opt := range opts {
 		opt(e)

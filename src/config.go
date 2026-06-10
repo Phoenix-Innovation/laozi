@@ -47,6 +47,11 @@ const (
 	RequireReference  = true
 )
 
+// RequireApproval gates DSL-created artifacts behind human review by default.
+// Consumed by ProposeCategory (draft.go); override per-engine with
+// WithConfig(Config{AutoApprove: true}).
+const RequireApproval = true
+
 // InvalidPlaceholders are substrings that, if present in LLM output text,
 // indicate an unfilled template and fail validation. Consumed by Config.defaults.
 var InvalidPlaceholders = []string{
