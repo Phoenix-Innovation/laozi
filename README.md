@@ -1,4 +1,16 @@
-# Laozi
+<p align="center">
+  <img src="docs/logo.png" alt="Laozi" width="100">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Lao_Zi-by_Pi.Tech-0f7d72?style=flat-square" alt="by Pi.Tech">
+</p>
+
+<h1 align="center">Laozi</h1>
+
+<p align="center"><em>A Go plugin that keeps the LLM from deciding the parts that have to be right.</em></p>
+
+---
 
 **Dual-Constraint Insight Generation Engine (Go)**
 
