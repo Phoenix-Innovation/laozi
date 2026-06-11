@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="docs/logo.png" alt="Laozi" width="100">
+  <img src="docs/logo.png" alt="Laozi" width="300">
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Lao_Zi-by_Pi.Tech-0f7d72?style=flat-square" alt="by Pi.Tech">
 </p>
 
-<h1 align="center">Laozi</h1>
+<h1 align="center">Lao Zi</h1>
 
 <p align="center"><em>A Go plugin that keeps the LLM from deciding the parts that have to be right.</em></p>
 
@@ -16,7 +16,7 @@
 
 [![Go Tests](https://github.com/Phoenix-Innovation/laozi/actions/workflows/test.yml/badge.svg)](https://github.com/Phoenix-Innovation/laozi/actions/workflows/test.yml)
 
-Laozi is a domain-agnostic insight engine that constrains an LLM so its output is
+Lao Zi is a domain-agnostic insight engine that constrains an LLM so its output is
 deterministic where it matters. Numbers, severities, and citations are computed in
 Go *before* the model is called; the LLM only writes the prose around them, and a
 post-generation enforcement layer corrects (and logs) any deviation it produces.
@@ -294,9 +294,9 @@ engine.SetContext("user", map[string]any{"role": "CFO"}) // goroutine-safe
 
 ---
 
-## Laozi Expression Language (DSL)
+## Lao Zi Expression Language (DSL)
 
-A threshold may carry an `Expression` written in the Laozi DSL — a small, deterministic
+A threshold may carry an `Expression` written in the Lao Zi DSL — a small, deterministic
 language that **parses, validates, and compiles to SQL**. The engine itself does not
 execute SQL: the host runs the compiled query against its datastore and feeds the
 numeric result back as the metric value, preserving "the LLM narrates, never calculates."
@@ -344,7 +344,7 @@ Operators follow PEMDAS (`^` right-associative). Named periods: `YTD`, `MTD`, `Q
 
 ## Human validation loop
 
-Because Laozi is a plugin (it cannot render UI), a category created with DSL is not
+Because Lao Zi is a plugin (it cannot render UI), a category created with DSL is not
 registered immediately. `ProposeCategory` validates every expression and returns a
 **Draft** — JSON-serializable, carrying each expression's compiled SQL and validation
 result for the host app to render. The category is promoted to production only when the
@@ -457,7 +457,7 @@ lines.
 
 ## Durable audit
 
-Laozi computes the auditable facts — the enforced severity/citation/number
+Lao Zi computes the auditable facts — the enforced severity/citation/number
 corrections (`Insight.Violations`) and the human draft decisions — but it does
 **not** pick a datastore. Persistence is implementation-dependent: a host plugs
 an `AuditSink` over Postgres, an append-only log, an object store, Kafka, a WORM
