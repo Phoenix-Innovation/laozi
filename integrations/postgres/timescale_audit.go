@@ -18,7 +18,10 @@ var _ laozi.AuditSink = (*TimescaleAuditSink)(nil)
 
 const defaultAuditTable = "laozi_audit"
 
-// TimescaleAuditSink persists audit events to a TimescaleDB hypertable.
+// TimescaleAuditSink persists audit events to a TimescaleDB hypertable. Each
+// row is hash-chained (sha256 over the previous row's hash plus this event's
+// canonical JSON), the same scheme as laozi.MemoryAuditSink, so a tampered or
+// reordered row is detectable with Verify. See schema.sql for the table.
 type TimescaleAuditSink struct {
 	pool  *pgxpool.Pool
 	table string
@@ -28,8 +31,13 @@ type TimescaleAuditSink struct {
 type AuditOption func(*TimescaleAuditSink)
 
 // WithAuditTable overrides the table name (default "laozi_audit").
+// A name that is not a safe identifier is ignored, leaving the default.
 func WithAuditTable(name string) AuditOption {
-	return func(s *TimescaleAuditSink) { s.table = name }
+	return func(s *TimescaleAuditSink) {
+		if safePgIdent(name) {
+			s.table = name
+		}
+	}
 }
 
 // NewTimescaleAuditSink returns a sink writing to the given pool.
@@ -79,7 +87,8 @@ func (s *TimescaleAuditSink) Record(ctx context.Context, e laozi.AuditEvent) err
 	return tx.Commit(ctx)
 }
 
-// Verify recomputes the chain from the table and reports whether it is intact. This verifies no tampering.
+// Verify recomputes the chain from the table and reports whether it is intact
+// (no row altered, removed, or reordered since it was written).
 func (s *TimescaleAuditSink) Verify(ctx context.Context) (bool, error) {
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(`SELECT prev_hash, hash, payload FROM %s ORDER BY seq ASC`, s.table))
 	if err != nil {

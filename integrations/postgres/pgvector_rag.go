@@ -22,8 +22,9 @@ type Embedder interface {
 
 const defaultRAGTable = "laozi_rag_documents"
 
-// Search embeds thequery and ranks documents by cosine similarity using the pgvector <=>
-// operator. See schema.sql.
+// PgVectorRAG is a RAGStore backed by Postgres + pgvector. Search embeds the
+// query and ranks documents by cosine similarity using the pgvector <=>
+// operator. See schema.sql for the table and index.
 type PgVectorRAG struct {
 	pool          *pgxpool.Pool
 	embed         Embedder
@@ -31,10 +32,44 @@ type PgVectorRAG struct {
 	minSimilarity float64
 }
 
+// RAGOption configures a PgVectorRAG.
 type RAGOption func(*PgVectorRAG)
 
 // WithRAGTable overrides the table name (default "laozi_rag_documents").
-func WithRAGTable(name string) RAGOption { return func(r *PgVectorRAG) { r.table = name } }
+// A name that is not a safe (optionally schema-qualified) identifier is ignored,
+// leaving the default, so the table can never carry injected SQL.
+func WithRAGTable(name string) RAGOption {
+	return func(r *PgVectorRAG) {
+		if safePgIdent(name) {
+			r.table = name
+		}
+	}
+}
+
+// safePgIdent reports whether name is a safe (optionally schema-qualified)
+// Postgres identifier, so it may be interpolated into a table position without
+// risk of SQL injection. (C-10)
+func safePgIdent(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, part := range strings.Split(name, ".") {
+		if part == "" {
+			return false
+		}
+		for i := 0; i < len(part); i++ {
+			c := part[i]
+			ok := c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			if i > 0 {
+				ok = ok || (c >= '0' && c <= '9')
+			}
+			if !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // WithMinSimilarity drops results below the given cosine similarity (0..1).
 func WithMinSimilarity(s float64) RAGOption { return func(r *PgVectorRAG) { r.minSimilarity = s } }
@@ -48,7 +83,7 @@ func NewPgVectorRAG(pool *pgxpool.Pool, embed Embedder, opts ...RAGOption) *PgVe
 	return r
 }
 
-// Add embeds the document's content and stores it.
+// Add embeds the document's content and stores it. Use it to ingest the corpus.
 func (r *PgVectorRAG) Add(ctx context.Context, doc laozi.RAGResult) error {
 	vec, err := r.embed.Embed(ctx, doc.Content)
 	if err != nil {
@@ -62,7 +97,7 @@ func (r *PgVectorRAG) Add(ctx context.Context, doc laozi.RAGResult) error {
 }
 
 // Search embeds the query and returns the top-K most similar documents by
-// cosine similarity. Score is 1 - cosine_distance.
+// cosine similarity. Score is 1 - cosine_distance. Satisfies laozi.RAGStore.
 func (r *PgVectorRAG) Search(ctx context.Context, query string, limit int) ([]laozi.RAGResult, error) {
 	vec, err := r.embed.Embed(ctx, query)
 	if err != nil {
@@ -92,7 +127,8 @@ func (r *PgVectorRAG) Search(ctx context.Context, query string, limit int) ([]la
 }
 
 // vectorLiteral formats a vector in pgvector's text form, "[v1,v2,...]", which
-// is cast with $n::vector in the queries above. No pgvector-go type registration required.
+// is cast with $n::vector in the queries above. This keeps the dependency
+// surface to pgx alone (no pgvector-go type registration required).
 func vectorLiteral(v []float32) string {
 	var b strings.Builder
 	b.Grow(len(v)*8 + 2)
