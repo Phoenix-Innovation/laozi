@@ -177,13 +177,18 @@ func (c *Classifier) llmClassify(ctx context.Context, message string, history []
 	if err != nil {
 		return "", false
 	}
-	low := strings.ToLower(out)
+	// Require the response to BE exactly one allowed category word (after
+	// trimming surrounding whitespace/punctuation/quotes). Substring matching
+	// would accept commentary, multiple domains, or an adversarial phrase that
+	// merely contains a domain name — which breaks the "exactly one category
+	// word" contract. A non-conforming reply falls through to Layer 2.
+	low := strings.Trim(strings.ToLower(strings.TrimSpace(out)), ".,:;!?\"'`")
 	for _, d := range c.domains {
-		if strings.Contains(low, strings.ToLower(d.Name)) {
+		if low == strings.ToLower(d.Name) {
 			return d.Name, true
 		}
 	}
-	return "", false // fallback/unknown -> fall through to Layer 2
+	return "", false // not exactly one known category → fall through to Layer 2
 }
 
 // AnalyzeSelected analyzes only the named categories — the context-limiting step

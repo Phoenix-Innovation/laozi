@@ -137,14 +137,18 @@ func (e *Engine) ProposeCategory(cat Category, actor string) (*Draft, error) {
 	reviewer := e.reviewer
 	e.mu.Unlock()
 
-	e.emitAudit(context.Background(), AuditEvent{
+	if err := e.emitAudit(context.Background(), AuditEvent{
 		Time: d.CreatedAt, Kind: "draft_proposed", Actor: actor, DraftID: id, CategoryID: cat.ID,
-	})
+	}); err != nil && e.auditStrict {
+		return d, fmt.Errorf("audit write failed: %w", err)
+	}
 	if auto {
-		e.emitAudit(context.Background(), AuditEvent{
+		if err := e.emitAudit(context.Background(), AuditEvent{
 			Time: d.DecidedAt, Kind: "draft_approved", Actor: actor, DraftID: id, CategoryID: cat.ID,
 			Detail: "auto-approved (approval gate disabled)",
-		})
+		}); err != nil && e.auditStrict {
+			return d, fmt.Errorf("audit write failed: %w", err)
+		}
 	}
 	if reviewer != nil {
 		reviewer.OnDraft(d)
@@ -175,9 +179,11 @@ func (e *Engine) ApproveDraft(id, actor string) error {
 	}
 	e.mu.Unlock()
 
-	e.emitAudit(context.Background(), AuditEvent{
+	if err := e.emitAudit(context.Background(), AuditEvent{
 		Time: time.Now(), Kind: "draft_approved", Actor: actor, DraftID: id, CategoryID: catID,
-	})
+	}); err != nil && e.auditStrict {
+		return fmt.Errorf("audit write failed: %w", err)
+	}
 	return nil
 }
 
@@ -203,9 +209,11 @@ func (e *Engine) RejectDraft(id, actor, reason string) error {
 	}
 	e.mu.Unlock()
 
-	e.emitAudit(context.Background(), AuditEvent{
+	if err := e.emitAudit(context.Background(), AuditEvent{
 		Time: time.Now(), Kind: "draft_rejected", Actor: actor, DraftID: id, CategoryID: catID, Detail: reason,
-	})
+	}); err != nil && e.auditStrict {
+		return fmt.Errorf("audit write failed: %w", err)
+	}
 	return nil
 }
 

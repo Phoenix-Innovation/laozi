@@ -65,7 +65,7 @@ var InvalidPlaceholders = []string{
 
 // ValidSeverities is the set of severities an LLM response may declare.
 // Consumed by parseResponse (laozi.go).
-var ValidSeverities = []Severity{SeverityWarning, SeveritySuccess, SeverityInfo}
+var ValidSeverities = []Severity{SeverityWarning, SeveritySuccess, SeverityInfo, SeverityUnavailable}
 
 // ================================================================================
 // PROMPT TEMPLATES (text/template syntax; rendered in laozi.go)

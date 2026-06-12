@@ -65,7 +65,7 @@ func TestTruthTable(t *testing.T) {
 
 		{name: "06_missing_metric", thresholds: ratioTh, metrics: map[string]float64{"unrelated": 5},
 			llmResp:      `{"insight":{"text":"No current_ratio data was provided.","severity":"success",` + good + `}}`,
-			wantSeverity: SeveritySuccess, refContains: "cfainstitute.org", wantViolations: []string{}},
+			wantSeverity: SeverityUnavailable, refContains: "cfainstitute.org", wantViolations: []string{"unavailable"}},
 
 		{name: "07_bogus_citation", thresholds: ratioTh, metrics: map[string]float64{"current_ratio": 1.2},
 			llmResp:      `{"insight":{"text":"current_ratio is 1.20.","severity":"warning","reference":"Made Up - https://evil.example/fake"}}`,

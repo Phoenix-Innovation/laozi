@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,10 @@ const (
 	SeverityWarning Severity = "warning" // Value outside threshold
 	SeveritySuccess Severity = "success" // Value within threshold
 	SeverityInfo    Severity = "info"    // Educational/informational
+	// SeverityUnavailable means the required metric(s) were not supplied, so no
+	// determination could be made. It is never "success" — a missing input must
+	// not read as a passing result.
+	SeverityUnavailable Severity = "unavailable"
 )
 
 // Threshold defines a constraint for a metric.
@@ -176,17 +181,18 @@ func (c Config) defaults() Config {
 
 // Engine is the main Laozi insight generator.
 type Engine struct {
-	categories map[string]Category
-	llm        LLMClient
-	rag        RAGStore
-	context    map[string]interface{}
-	mu         sync.RWMutex
-	strict     bool
-	cfg        Config
-	drafts     map[string]*Draft
-	nextDraft  int
-	reviewer   Reviewer
-	audit      AuditSink
+	categories  map[string]Category
+	llm         LLMClient
+	rag         RAGStore
+	context     map[string]interface{}
+	mu          sync.RWMutex
+	strict      bool
+	cfg         Config
+	drafts      map[string]*Draft
+	nextDraft   int
+	reviewer    Reviewer
+	audit       AuditSink
+	auditStrict bool
 }
 
 // New creates a new Laozi engine.
@@ -234,14 +240,18 @@ func WithContext(key string, value interface{}) Option {
 
 // AddCategory registers a category with its thresholds.
 func (e *Engine) AddCategory(cat Category) {
+	e.mu.Lock()
 	e.categories[cat.ID] = cat
+	e.mu.Unlock()
 }
 
 // AddCategories registers multiple categories.
 func (e *Engine) AddCategories(cats []Category) {
+	e.mu.Lock()
 	for _, cat := range cats {
 		e.categories[cat.ID] = cat
 	}
+	e.mu.Unlock()
 }
 
 // SetContext updates engine context (goroutine-safe).
@@ -277,10 +287,14 @@ func (e *Engine) Analyze(ctx context.Context, metrics map[string]float64) ([]Ins
 		err     error
 	}
 
+	e.mu.RLock()
 	cats := make([]Category, 0, len(e.categories))
 	for _, cat := range e.categories {
 		cats = append(cats, cat)
 	}
+	e.mu.RUnlock()
+	// Deterministic output order (map iteration order is not stable).
+	sort.Slice(cats, func(i, j int) bool { return cats[i].ID < cats[j].ID })
 
 	results := make([]result, len(cats))
 	sem := make(chan struct{}, e.cfg.MaxParallel)
@@ -313,7 +327,9 @@ func (e *Engine) Analyze(ctx context.Context, metrics map[string]float64) ([]Ins
 
 // AnalyzeCategory generates an insight for a specific category.
 func (e *Engine) AnalyzeCategory(ctx context.Context, categoryID string, metrics map[string]float64) (*Insight, error) {
+	e.mu.RLock()
 	cat, ok := e.categories[categoryID]
+	e.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("category not found: %s", categoryID)
 	}
@@ -329,14 +345,16 @@ func (e *Engine) AnalyzeCategory(ctx context.Context, categoryID string, metrics
 func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
 	ins, err := e.analyzeCategoryInner(ctx, cat, metrics)
 	if err == nil && ins != nil {
-		e.emitAudit(ctx, AuditEvent{
+		if auditErr := e.emitAudit(ctx, AuditEvent{
 			Time:       time.Now(),
 			Kind:       "analysis",
 			CategoryID: cat.ID,
 			Metrics:    metrics,
 			Insight:    ins,
 			Strict:     e.strict,
-		})
+		}); auditErr != nil && e.auditStrict {
+			return nil, fmt.Errorf("audit write failed: %w", auditErr)
+		}
 	}
 	return ins, err
 }
@@ -344,6 +362,18 @@ func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[
 func (e *Engine) analyzeCategoryInner(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
 	// Step 1: Deterministic ground truth.
 	comp := computeAnalysis(cat, metrics)
+
+	// Missing required inputs: never call the model and never let it read as a
+	// pass. Return the deterministic insufficient-data insight directly.
+	if comp.severity == SeverityUnavailable {
+		ins := e.buildFallbackInsight(cat, comp)
+		ins.Violations = append(ins.Violations, Violation{
+			Kind:     "unavailable",
+			Enforced: string(SeverityUnavailable),
+			Detail:   "required metric(s) absent: " + strings.Join(comp.missing, ", "),
+		})
+		return ins, nil
+	}
 
 	guidelinesText := e.buildGuidelinesText(cat)
 
@@ -460,6 +490,7 @@ type computedAnalysis struct {
 	reference   string
 	lines       []metricLine
 	allowed     []float64
+	missing     []string // required metrics that were absent from the input
 }
 
 type metricLine struct {
@@ -477,6 +508,7 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
 	seenRef := map[string]bool{}
 	var refs []string
 
+	evaluated := 0
 	for _, t := range cat.Thresholds {
 		if t.SourceURL != "" {
 			key := t.Source + "|" + t.SourceURL
@@ -488,8 +520,10 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
 
 		val, ok := metrics[t.Metric]
 		if !ok {
+			c.missing = append(c.missing, t.Metric)
 			continue
 		}
+		evaluated++
 
 		var status string
 		switch {
@@ -521,6 +555,10 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
 
 	if cat.Educational {
 		c.severity = SeverityInfo
+	} else if len(cat.Thresholds) > 0 && evaluated == 0 {
+		// Required metrics were supplied for none of the thresholds. A missing
+		// input must never read as "success" — report it explicitly.
+		c.severity = SeverityUnavailable
 	}
 	c.metricsText = sb.String()
 	c.reference = strings.Join(refs, "; ")
@@ -639,6 +677,14 @@ func enforceGoal(g *SuggestedGoal, cat Category, c computedAnalysis) *Violation 
 }
 
 func (c computedAnalysis) renderText() string {
+	if len(c.lines) == 0 {
+		if len(c.missing) > 0 {
+			return fmt.Sprintf(
+				"Insufficient data: the required metric(s) %s were not provided, so no determination could be made.",
+				strings.Join(c.missing, ", "))
+		}
+		return "Insufficient data: no metrics were available, so no determination could be made."
+	}
 	var sb strings.Builder
 	for _, l := range c.lines {
 		switch l.status {

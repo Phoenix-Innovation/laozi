@@ -47,15 +47,23 @@ func WithAuditSink(s AuditSink) Option {
 	return func(e *Engine) { e.audit = s }
 }
 
-// emitAudit records an event if a sink is configured. The error is intentionally
-// not propagated into analysis/approval flow (a transient audit hiccup should
-// not fail an insight or an approval); hosts needing audit-before-ack semantics
-// implement that inside Record (durable write, retry, dead-letter, or panic).
-func (e *Engine) emitAudit(ctx context.Context, ev AuditEvent) {
+// WithStrictAudit makes a failed audit write fail the operation (analysis or
+// draft decision) instead of being swallowed. Off by default — analytics use
+// cases prefer availability — but regulated workflows that must not produce an
+// operation without a durable record should turn this on (fail-closed).
+func WithStrictAudit(strict bool) Option {
+	return func(e *Engine) { e.auditStrict = strict }
+}
+
+// emitAudit records an event if a sink is configured and returns the sink's
+// error. Callers decide what to do with it: by default it is ignored (a
+// transient audit hiccup should not fail an insight or approval), but under
+// WithStrictAudit the caller fails the operation instead.
+func (e *Engine) emitAudit(ctx context.Context, ev AuditEvent) error {
 	if e.audit == nil {
-		return
+		return nil
 	}
-	_ = e.audit.Record(ctx, ev)
+	return e.audit.Record(ctx, ev)
 }
 
 // ---- Reference sink: in-memory, append-only, hash-chained -----------------
