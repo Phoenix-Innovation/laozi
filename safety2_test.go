@@ -71,6 +71,13 @@ func TestRegistrationValidation(t *testing.T) {
 	if err := e.AddCategory(Category{ID: "good", Thresholds: safeTh}); err != nil {
 		t.Errorf("valid category rejected: %v", err)
 	}
+	// re-registering an existing ID must error, not silently overwrite
+	if err := e.AddCategory(Category{ID: "good", Thresholds: safeTh}); err == nil {
+		t.Error("expected error re-registering an existing category ID")
+	}
+	if err := e.AddCategories([]Category{{ID: "good", Thresholds: safeTh}}); err == nil {
+		t.Error("expected error registering an already-registered ID via AddCategories")
+	}
 	// duplicate IDs within a batch
 	if err := e.AddCategories([]Category{{ID: "d", Thresholds: safeTh}, {ID: "d", Thresholds: safeTh}}); err == nil {
 		t.Error("expected duplicate-ID batch error")
@@ -133,6 +140,19 @@ func TestDraftAtomicityUnderStrictAudit(t *testing.T) {
 	if _, err := e2.AnalyzeCategory(context.Background(), "q", map[string]float64{"current_ratio": 2}); err == nil {
 		t.Error("failed strict approve must not promote the category")
 	}
+
+	// RejectDraft: propose succeeds, reject's audit fails -> draft stays pending.
+	e3 := New(WithLLM(mockLLM{resp: okLLM}), WithAuditSink(&flakySink{failOn: 2}), WithStrictAudit(true))
+	d3, err := e3.ProposeCategory(Category{ID: "r", Thresholds: safeTh}, "alice")
+	if err != nil {
+		t.Fatalf("propose should succeed (sink ok on first call): %v", err)
+	}
+	if err := e3.RejectDraft(d3.ID, "bob", "nope"); err == nil {
+		t.Fatal("expected reject to fail under strict audit failure")
+	}
+	if got3, _ := e3.Draft(d3.ID); got3 == nil || got3.Status != StatusDraft {
+		t.Error("failed strict reject must leave the draft pending")
+	}
 }
 
 // C-07: analysis events carry provenance; failures are recorded.
@@ -176,7 +196,8 @@ func (failRAG) Search(context.Context, string, int) ([]RAGResult, error) {
 
 // C-09: when RequireRAG is set, a retrieval failure fails closed.
 func TestRequireRAGFailsClosed(t *testing.T) {
-	e := New(WithLLM(mockLLM{resp: okLLM}), WithRAG(failRAG{}))
+	sink := NewMemoryAuditSink()
+	e := New(WithLLM(mockLLM{resp: okLLM}), WithRAG(failRAG{}), WithAuditSink(sink))
 	e.AddCategory(Category{ID: "liq", Thresholds: safeTh, RAGQuery: "liquidity", RequireRAG: true})
 	ins, err := e.AnalyzeCategory(context.Background(), "liq", map[string]float64{"current_ratio": 2})
 	if err != nil {
@@ -193,6 +214,16 @@ func TestRequireRAGFailsClosed(t *testing.T) {
 	}
 	if !hasRagViolation {
 		t.Error("expected a rag_unavailable violation")
+	}
+	// C-07: the retrieval failure must be recorded in the audit trail.
+	foundRetrievalFailed := false
+	for _, en := range sink.Entries() {
+		if en.Kind == "retrieval_failed" {
+			foundRetrievalFailed = true
+		}
+	}
+	if !foundRetrievalFailed {
+		t.Error("expected a retrieval_failed audit event")
 	}
 }
 

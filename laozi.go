@@ -303,8 +303,11 @@ func (e *Engine) AddCategory(cat Category) error {
 		return fmt.Errorf("invalid category %q: %w", cat.ID, err)
 	}
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, exists := e.categories[cat.ID]; exists {
+		return fmt.Errorf("category %q already registered; change an existing category through the draft/approval flow", cat.ID)
+	}
 	e.categories[cat.ID] = cat
-	e.mu.Unlock()
 	return nil
 }
 
@@ -322,10 +325,15 @@ func (e *Engine) AddCategories(cats []Category) error {
 		batch[cat.ID] = true
 	}
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, cat := range cats {
+		if _, exists := e.categories[cat.ID]; exists {
+			return fmt.Errorf("category %q already registered; change an existing category through the draft/approval flow", cat.ID)
+		}
+	}
 	for _, cat := range cats {
 		e.categories[cat.ID] = cat
 	}
-	e.mu.Unlock()
 	return nil
 }
 
