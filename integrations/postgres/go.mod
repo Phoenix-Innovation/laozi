@@ -3,7 +3,7 @@ module github.com/Phoenix-Innovation/laozi/integrations/postgres
 go 1.21
 
 require (
-	github.com/Phoenix-Innovation/laozi v0.5.1-beta
+	github.com/Phoenix-Innovation/laozi v0.5.2-beta
 	github.com/jackc/pgx/v5 v5.6.0
 )
 
