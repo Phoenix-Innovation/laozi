@@ -112,44 +112,57 @@ func (e *Engine) ProposeCategory(cat Category, actor string) (*Draft, error) {
 		}
 		return nil, fmt.Errorf("category %q has invalid DSL expressions: %v", cat.ID, msgs)
 	}
+	if err := ValidateCategory(cat); err != nil {
+		return nil, fmt.Errorf("invalid category %q: %w", cat.ID, err)
+	}
 
 	e.mu.Lock()
 	e.nextDraft++
 	id := fmt.Sprintf("draft-%d", e.nextDraft)
+	reviewer := e.reviewer
+	e.mu.Unlock()
+
+	now := time.Now()
 	catCopy := cat
 	d := &Draft{
 		ID:          id,
 		Kind:        "category",
 		Status:      StatusDraft,
-		CreatedAt:   time.Now(),
+		CreatedAt:   now,
 		CreatedBy:   actor,
 		Category:    &catCopy,
 		Expressions: reviews,
 	}
-	e.drafts[id] = d
 	auto := !e.approvalRequired()
 	if auto {
 		d.Status = StatusApproved
 		d.DecidedBy = actor
-		d.DecidedAt = time.Now()
-		e.categories[cat.ID] = cat // promote immediately
+		d.DecidedAt = now
 	}
-	reviewer := e.reviewer
-	e.mu.Unlock()
 
+	// Audit BEFORE committing: under strict audit a failed write must leave no
+	// draft and promote no category (atomicity).
 	if err := e.emitAudit(context.Background(), AuditEvent{
-		Time: d.CreatedAt, Kind: "draft_proposed", Actor: actor, DraftID: id, CategoryID: cat.ID,
+		Time: now, Kind: "draft_proposed", Actor: actor, DraftID: id, CategoryID: cat.ID,
 	}); err != nil && e.auditStrict {
-		return d, fmt.Errorf("audit write failed: %w", err)
+		return nil, fmt.Errorf("audit write failed, draft not created: %w", err)
 	}
 	if auto {
 		if err := e.emitAudit(context.Background(), AuditEvent{
-			Time: d.DecidedAt, Kind: "draft_approved", Actor: actor, DraftID: id, CategoryID: cat.ID,
+			Time: now, Kind: "draft_approved", Actor: actor, DraftID: id, CategoryID: cat.ID,
 			Detail: "auto-approved (approval gate disabled)",
 		}); err != nil && e.auditStrict {
-			return d, fmt.Errorf("audit write failed: %w", err)
+			return nil, fmt.Errorf("audit write failed, draft not created: %w", err)
 		}
 	}
+
+	e.mu.Lock()
+	e.drafts[id] = d
+	if auto {
+		e.categories[cat.ID] = cat
+	}
+	e.mu.Unlock()
+
 	if reviewer != nil {
 		reviewer.OnDraft(d)
 	}
@@ -159,61 +172,87 @@ func (e *Engine) ProposeCategory(cat Category, actor string) (*Draft, error) {
 // ApproveDraft promotes a draft to production. For a category draft this
 // registers the category so Analyze will use it.
 func (e *Engine) ApproveDraft(id, actor string) error {
-	e.mu.Lock()
+	e.mu.RLock()
 	d, ok := e.drafts[id]
 	if !ok {
-		e.mu.Unlock()
+		e.mu.RUnlock()
 		return fmt.Errorf("draft not found: %s", id)
 	}
 	if d.Status != StatusDraft {
-		e.mu.Unlock()
+		e.mu.RUnlock()
 		return fmt.Errorf("draft %s is %s, not pending", id, d.Status)
+	}
+	catID := ""
+	if d.Kind == "category" && d.Category != nil {
+		catID = d.Category.ID
+	}
+	e.mu.RUnlock()
+
+	now := time.Now()
+	// Audit before committing: under strict audit, don't approve/promote if the
+	// record can't be written.
+	if err := e.emitAudit(context.Background(), AuditEvent{
+		Time: now, Kind: "draft_approved", Actor: actor, DraftID: id, CategoryID: catID,
+	}); err != nil && e.auditStrict {
+		return fmt.Errorf("audit write failed, draft not approved: %w", err)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	d, ok = e.drafts[id]
+	if !ok {
+		return fmt.Errorf("draft not found: %s", id)
+	}
+	if d.Status != StatusDraft {
+		return fmt.Errorf("draft %s changed concurrently (now %s)", id, d.Status)
 	}
 	d.Status = StatusApproved
 	d.DecidedBy = actor
-	d.DecidedAt = time.Now()
-	catID := ""
+	d.DecidedAt = now
 	if d.Kind == "category" && d.Category != nil {
 		e.categories[d.Category.ID] = *d.Category
-		catID = d.Category.ID
-	}
-	e.mu.Unlock()
-
-	if err := e.emitAudit(context.Background(), AuditEvent{
-		Time: time.Now(), Kind: "draft_approved", Actor: actor, DraftID: id, CategoryID: catID,
-	}); err != nil && e.auditStrict {
-		return fmt.Errorf("audit write failed: %w", err)
 	}
 	return nil
 }
 
 // RejectDraft marks a draft rejected; it is never promoted.
 func (e *Engine) RejectDraft(id, actor, reason string) error {
-	e.mu.Lock()
+	e.mu.RLock()
 	d, ok := e.drafts[id]
 	if !ok {
-		e.mu.Unlock()
+		e.mu.RUnlock()
 		return fmt.Errorf("draft not found: %s", id)
 	}
 	if d.Status != StatusDraft {
-		e.mu.Unlock()
+		e.mu.RUnlock()
 		return fmt.Errorf("draft %s is %s, not pending", id, d.Status)
 	}
-	d.Status = StatusRejected
-	d.DecidedBy = actor
-	d.DecidedAt = time.Now()
-	d.RejectReason = reason
 	catID := ""
 	if d.Category != nil {
 		catID = d.Category.ID
 	}
-	e.mu.Unlock()
+	e.mu.RUnlock()
 
+	now := time.Now()
 	if err := e.emitAudit(context.Background(), AuditEvent{
-		Time: time.Now(), Kind: "draft_rejected", Actor: actor, DraftID: id, CategoryID: catID, Detail: reason,
+		Time: now, Kind: "draft_rejected", Actor: actor, DraftID: id, CategoryID: catID, Detail: reason,
 	}); err != nil && e.auditStrict {
-		return fmt.Errorf("audit write failed: %w", err)
+		return fmt.Errorf("audit write failed, draft not rejected: %w", err)
 	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	d, ok = e.drafts[id]
+	if !ok {
+		return fmt.Errorf("draft not found: %s", id)
+	}
+	if d.Status != StatusDraft {
+		return fmt.Errorf("draft %s changed concurrently (now %s)", id, d.Status)
+	}
+	d.Status = StatusRejected
+	d.DecidedBy = actor
+	d.DecidedAt = now
+	d.RejectReason = reason
 	return nil
 }
 
@@ -222,7 +261,28 @@ func (e *Engine) Draft(id string) (*Draft, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	d, ok := e.drafts[id]
-	return d, ok
+	if !ok {
+		return nil, false
+	}
+	return cloneDraft(d), true
+}
+
+// cloneDraft returns a deep copy so callers cannot mutate engine state.
+func cloneDraft(d *Draft) *Draft {
+	if d == nil {
+		return nil
+	}
+	cd := *d
+	cd.Category = cloneCategoryPtr(d.Category)
+	if d.Expressions != nil {
+		ex := make([]ExpressionReview, len(d.Expressions))
+		copy(ex, d.Expressions)
+		for i := range ex {
+			ex[i].Errors = cloneStrings(d.Expressions[i].Errors)
+		}
+		cd.Expressions = ex
+	}
+	return &cd
 }
 
 // PendingDrafts returns all drafts still awaiting approval.
@@ -232,7 +292,7 @@ func (e *Engine) PendingDrafts() []*Draft {
 	var out []*Draft
 	for _, d := range e.drafts {
 		if d.Status == StatusDraft {
-			out = append(out, d)
+			out = append(out, cloneDraft(d))
 		}
 	}
 	return out

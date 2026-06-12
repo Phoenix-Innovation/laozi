@@ -67,6 +67,10 @@ var InvalidPlaceholders = []string{
 // Consumed by parseResponse (laozi.go).
 var ValidSeverities = []Severity{SeverityWarning, SeveritySuccess, SeverityInfo, SeverityUnavailable}
 
+// PromptVersion identifies the prompt-template generation for the audit trail.
+// Bump it whenever the prompt templates change in a way that affects output.
+const PromptVersion = "metric/v1"
+
 // ================================================================================
 // PROMPT TEMPLATES (text/template syntax; rendered in laozi.go)
 // ================================================================================

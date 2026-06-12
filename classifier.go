@@ -117,13 +117,27 @@ func compileKeywords(keywords []string) *regexp.Regexp {
 }
 
 // Domains returns the registered domains (excluding the implicit fallback).
-func (c *Classifier) Domains() []Domain { return c.domains }
+func (c *Classifier) Domains() []Domain {
+	out := make([]Domain, len(c.domains))
+	for i, d := range c.domains {
+		out[i] = cloneDomain(d)
+	}
+	return out
+}
+
+// cloneDomain copies the slice fields so callers cannot mutate classifier state.
+func cloneDomain(d Domain) Domain {
+	d.Keywords = cloneStrings(d.Keywords)
+	d.Categories = cloneStrings(d.Categories)
+	d.Actions = cloneStrings(d.Actions)
+	return d
+}
 
 // Domain looks up a registered domain by name.
 func (c *Classifier) Domain(name string) (Domain, bool) {
 	for _, d := range c.domains {
 		if d.Name == name {
-			return d, true
+			return cloneDomain(d), true
 		}
 	}
 	return Domain{}, false

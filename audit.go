@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -26,14 +27,23 @@ import (
 // human loop; analysis events leave Actor empty (the engine, not a person).
 type AuditEvent struct {
 	Time       time.Time          `json:"time"`
-	Kind       string             `json:"kind"` // analysis | draft_proposed | draft_approved | draft_rejected
+	Kind       string             `json:"kind"` // analysis | analysis_failed | retrieval_failed | draft_proposed | draft_approved | draft_rejected
 	Actor      string             `json:"actor,omitempty"`
 	CategoryID string             `json:"category_id,omitempty"`
 	Metrics    map[string]float64 `json:"metrics,omitempty"`
 	Insight    *Insight           `json:"insight,omitempty"` // includes Violations (the proof)
 	Strict     bool               `json:"strict,omitempty"`
 	DraftID    string             `json:"draft_id,omitempty"`
-	Detail     string             `json:"detail,omitempty"` // e.g. reject reason
+	Detail     string             `json:"detail,omitempty"` // e.g. reject reason, error message
+
+	// Provenance — enough to reconstruct *why* a result was produced.
+	RequestID       string   `json:"request_id,omitempty"`       // correlates events from one analysis call
+	Model           string   `json:"model,omitempty"`            // LLM model identifier
+	PromptVersion   string   `json:"prompt_version,omitempty"`   // prompt template version
+	CategoryVersion string   `json:"category_version,omitempty"` // Category.Version
+	Sources         []string `json:"sources,omitempty"`          // citations backing the result
+	SourceHash      string   `json:"source_hash,omitempty"`      // sha256 of the joined sources
+	ErrorKind       string   `json:"error_kind,omitempty"`       // for failure events
 }
 
 // AuditSink receives audit events. Implementations MUST be safe for concurrent
@@ -61,6 +71,9 @@ func WithStrictAudit(strict bool) Option {
 // WithStrictAudit the caller fails the operation instead.
 func (e *Engine) emitAudit(ctx context.Context, ev AuditEvent) error {
 	if e.audit == nil {
+		if e.auditStrict {
+			return fmt.Errorf("strict audit enabled but no audit sink configured")
+		}
 		return nil
 	}
 	return e.audit.Record(ctx, ev)
@@ -97,8 +110,18 @@ func (m *MemoryAuditSink) Record(_ context.Context, e AuditEvent) error {
 	if n := len(m.entries); n > 0 {
 		prev = m.entries[n-1].Hash
 	}
-	m.entries = append(m.entries, AuditEntry{AuditEvent: e, PrevHash: prev, Hash: chainHash(prev, e)})
+	ce := cloneEvent(e) // store a copy so later caller mutation can't alter the record
+	m.entries = append(m.entries, AuditEntry{AuditEvent: ce, PrevHash: prev, Hash: chainHash(prev, ce)})
 	return nil
+}
+
+// cloneEvent deep-copies the mutable parts of an AuditEvent (Metrics map,
+// Insight pointer, Sources slice) so stored entries are immutable to callers.
+func cloneEvent(e AuditEvent) AuditEvent {
+	e.Metrics = cloneFloatMap(e.Metrics)
+	e.Insight = cloneInsight(e.Insight)
+	e.Sources = cloneStrings(e.Sources)
+	return e
 }
 
 // Entries returns a snapshot of the log, oldest first.
@@ -106,7 +129,9 @@ func (m *MemoryAuditSink) Entries() []AuditEntry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]AuditEntry, len(m.entries))
-	copy(out, m.entries)
+	for i, en := range m.entries {
+		out[i] = AuditEntry{AuditEvent: cloneEvent(en.AuditEvent), PrevHash: en.PrevHash, Hash: en.Hash}
+	}
 	return out
 }
 

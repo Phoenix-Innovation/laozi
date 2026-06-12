@@ -329,6 +329,12 @@ func (p *parser) parseMulDiv() (Expr, *DSLError) {
 }
 
 // parsePow: ^ is right-associative.
+// parsePow parses exponentiation, which is right-associative.
+//
+// PRECEDENCE NOTE (C-10): unary minus binds TIGHTER than '^', because the left
+// operand here is produced by parseUnary. So `-a^b` parses as `(-a)^b`, NOT the
+// `-(a^b)` you may expect from some languages. This is intentional and locked by
+// tests; use explicit parentheses (`-(a^b)`) when you mean the other grouping.
 func (p *parser) parsePow() (Expr, *DSLError) {
 	left, err := p.parseUnary()
 	if err != nil {
@@ -690,16 +696,52 @@ func CompileSQL(src string) (string, error) {
 	return compileNode(node), nil
 }
 
+// sqlEscapeLiteral makes a string safe to place inside single quotes in
+// generated SQL: single quotes are doubled (standard SQL escaping) and NUL
+// bytes are dropped. (C-10)
+func sqlEscapeLiteral(s string) string {
+	s = strings.ReplaceAll(s, "\x00", "")
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// sqlSafeIdent returns name unchanged when it is a plain identifier
+// ([A-Za-z_][A-Za-z0-9_]*); otherwise it returns a double-quoted, escaped
+// identifier so a non-conforming name cannot break out of identifier position.
+// (C-10)
+func sqlSafeIdent(name string) string {
+	if isSafeIdent(name) {
+		return name
+	}
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// isSafeIdent reports whether name is a bare SQL identifier.
+func isSafeIdent(name string) bool {
+	if name == "" || !isIdentStart(name[0]) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !isIdentPart(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 func compileNode(n Expr) string {
 	switch x := n.(type) {
 	case NumLit:
 		return strconv.FormatFloat(x.V, 'g', -1, 64)
 	case StrLit:
-		return "'" + x.V + "'"
+		return "'" + sqlEscapeLiteral(x.V) + "'"
 	case NullLit:
 		return "NULL"
 	case FieldRef:
-		return x.Name
+		// FieldRef.Name is produced only by the identifier lexer
+		// ([A-Za-z_][A-Za-z0-9_]*), so it is a safe SQL identifier by
+		// construction. sqlSafeIdent re-checks defensively in case an AST is
+		// built programmatically.
+		return sqlSafeIdent(x.Name)
 	case StarRef:
 		return "*"
 	case UnaryExpr:
@@ -715,9 +757,9 @@ func compileNode(n Expr) string {
 		return compileNode(x.L) + " " + x.Op + " " + compileNode(x.R)
 	case DurationExpr:
 		if x.Unit != "" && x.N == 0 {
-			return "'" + x.Unit + "'"
+			return "'" + sqlEscapeLiteral(x.Unit) + "'"
 		}
-		return fmt.Sprintf("'%d %s'", x.N, x.Unit)
+		return fmt.Sprintf("'%d %s'", x.N, sqlEscapeLiteral(x.Unit))
 	case FuncExpr:
 		return compileFunc(x, "")
 	case *ModExpr:

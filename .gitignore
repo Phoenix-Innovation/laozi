@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Codex / compliance-review working artifacts (not part of the library)
+COMPLIANCE_REVIEW.md
+_codex_*
+_compliance_*
+_run_review.ps1
+_poll.ps1
+_npm_*.ps1
+_cleanup.ps1

@@ -33,6 +33,9 @@ package laozi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -65,7 +68,7 @@ const (
 // Threshold defines a constraint for a metric.
 type Threshold struct {
 	Metric      string  `json:"metric"`
-	Expression  string  `json:"expression,omitempty"` // optional Laozi DSL; host compiles+runs it to produce Metric's value
+	Expression  string  `json:"expression,omitempty"` // optional Lao Zi DSL; host compiles+runs it to produce Metric's value
 	Min         float64 `json:"min"`
 	Max         float64 `json:"max"`
 	OptimalMin  float64 `json:"optimal_min,omitempty"`
@@ -74,6 +77,11 @@ type Threshold struct {
 	Source      string  `json:"source"`
 	SourceURL   string  `json:"source_url"`
 	Description string  `json:"description,omitempty"`
+	// Optional marks a metric whose absence does NOT make the category
+	// unavailable. By default every threshold metric is required: if any
+	// required metric is missing or non-finite, the category is Unavailable
+	// (never success).
+	Optional bool `json:"optional,omitempty"`
 }
 
 // Category groups related metrics and thresholds.
@@ -83,6 +91,12 @@ type Category struct {
 	Thresholds  []Threshold `json:"thresholds"`
 	Educational bool        `json:"educational"`
 	RAGQuery    string      `json:"rag_query,omitempty"`
+	// RequireRAG makes retrieval mandatory: if RAGQuery is set and retrieval
+	// fails or returns nothing, the category is Unavailable (fail closed)
+	// rather than silently proceeding without the cited evidence.
+	RequireRAG bool `json:"require_rag,omitempty"`
+	// Version identifies the category definition for the audit trail.
+	Version string `json:"version,omitempty"`
 }
 
 // Insight is the output from analysis. The Violations slice is the audit
@@ -239,21 +253,83 @@ func WithContext(key string, value interface{}) Option {
 }
 
 // AddCategory registers a category with its thresholds.
-func (e *Engine) AddCategory(cat Category) {
+// ValidateCategory checks a category is well-formed enough to produce
+// trustworthy deterministic output: non-empty ID, and for each threshold a
+// metric name, a unit, finite bounds with Min <= Max, consistent optimal range,
+// and a source/source URL when references are required.
+func ValidateCategory(cat Category) error {
+	if strings.TrimSpace(cat.ID) == "" {
+		return fmt.Errorf("category ID must be non-empty")
+	}
+	seen := map[string]bool{}
+	for i, t := range cat.Thresholds {
+		where := fmt.Sprintf("threshold %d (%q)", i, t.Metric)
+		if strings.TrimSpace(t.Metric) == "" {
+			return fmt.Errorf("%s: metric name must be non-empty", where)
+		}
+		if seen[t.Metric] {
+			return fmt.Errorf("%s: duplicate metric in category", where)
+		}
+		seen[t.Metric] = true
+		if strings.TrimSpace(t.Unit) == "" {
+			return fmt.Errorf("%s: unit must be non-empty", where)
+		}
+		for name, v := range map[string]float64{"min": t.Min, "max": t.Max, "optimal_min": t.OptimalMin, "optimal_max": t.OptimalMax} {
+			if !isFinite(v) {
+				return fmt.Errorf("%s: %s must be finite (got %v)", where, name, v)
+			}
+		}
+		if t.Min > t.Max {
+			return fmt.Errorf("%s: min (%v) must be <= max (%v)", where, t.Min, t.Max)
+		}
+		if t.OptimalMin != 0 || t.OptimalMax != 0 {
+			if t.OptimalMin > t.OptimalMax {
+				return fmt.Errorf("%s: optimal_min (%v) must be <= optimal_max (%v)", where, t.OptimalMin, t.OptimalMax)
+			}
+		}
+		if RequireReference && !cat.Educational {
+			if strings.TrimSpace(t.Source) == "" || strings.TrimSpace(t.SourceURL) == "" {
+				return fmt.Errorf("%s: source and source URL are required", where)
+			}
+		}
+	}
+	return nil
+}
+
+// AddCategory validates and registers a category (goroutine-safe). It returns
+// an error for malformed input; callers in regulated workflows must check it.
+func (e *Engine) AddCategory(cat Category) error {
+	if err := ValidateCategory(cat); err != nil {
+		return fmt.Errorf("invalid category %q: %w", cat.ID, err)
+	}
 	e.mu.Lock()
 	e.categories[cat.ID] = cat
 	e.mu.Unlock()
+	return nil
 }
 
-// AddCategories registers multiple categories.
-func (e *Engine) AddCategories(cats []Category) {
+// AddCategories validates all categories (and rejects duplicate IDs within the
+// batch) before registering any of them.
+func (e *Engine) AddCategories(cats []Category) error {
+	batch := map[string]bool{}
+	for _, cat := range cats {
+		if err := ValidateCategory(cat); err != nil {
+			return fmt.Errorf("invalid category %q: %w", cat.ID, err)
+		}
+		if batch[cat.ID] {
+			return fmt.Errorf("duplicate category ID in batch: %q", cat.ID)
+		}
+		batch[cat.ID] = true
+	}
 	e.mu.Lock()
 	for _, cat := range cats {
 		e.categories[cat.ID] = cat
 	}
 	e.mu.Unlock()
+	return nil
 }
 
+// AddCategories registers multiple categories.
 // SetContext updates engine context (goroutine-safe).
 func (e *Engine) SetContext(key string, value interface{}) {
 	e.mu.Lock()
@@ -343,23 +419,75 @@ func (e *Engine) AnalyzeCategory(ctx context.Context, categoryID string, metrics
 // analyzeCategory runs the per-category pipeline and emits one audit event for
 // the produced insight (covering Analyze, AnalyzeCategory, and AnalyzeSelected).
 func (e *Engine) analyzeCategory(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
-	ins, err := e.analyzeCategoryInner(ctx, cat, metrics)
-	if err == nil && ins != nil {
-		if auditErr := e.emitAudit(ctx, AuditEvent{
-			Time:       time.Now(),
-			Kind:       "analysis",
-			CategoryID: cat.ID,
-			Metrics:    metrics,
-			Insight:    ins,
-			Strict:     e.strict,
-		}); auditErr != nil && e.auditStrict {
+	requestID := newRequestID()
+	ins, err := e.analyzeCategoryInner(ctx, cat, metrics, requestID)
+	if err != nil {
+		// Record the failed attempt so the audit trail reflects it.
+		_ = e.emitAudit(ctx, AuditEvent{
+			Time: time.Now(), Kind: "analysis_failed", CategoryID: cat.ID,
+			Metrics: metrics, Strict: e.strict, RequestID: requestID,
+			Model: LLMModel, CategoryVersion: cat.Version,
+			ErrorKind: classifyErr(err), Detail: err.Error(),
+		})
+		return nil, err
+	}
+	if ins != nil {
+		ev := AuditEvent{
+			Time: time.Now(), Kind: "analysis", CategoryID: cat.ID,
+			Metrics: metrics, Insight: ins, Strict: e.strict,
+			RequestID: requestID, Model: LLMModel, PromptVersion: PromptVersion,
+			CategoryVersion: cat.Version,
+			Sources:         splitSources(ins.Reference),
+			SourceHash:      hashSources(ins.Reference),
+		}
+		if auditErr := e.emitAudit(ctx, ev); auditErr != nil && e.auditStrict {
 			return nil, fmt.Errorf("audit write failed: %w", auditErr)
 		}
 	}
 	return ins, err
 }
 
-func (e *Engine) analyzeCategoryInner(ctx context.Context, cat Category, metrics map[string]float64) (*Insight, error) {
+// newRequestID returns a short random hex correlation ID for one analysis call.
+func newRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("ts-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func splitSources(ref string) []string {
+	if strings.TrimSpace(ref) == "" {
+		return nil
+	}
+	return strings.Split(ref, "; ")
+}
+
+func hashSources(ref string) string {
+	if strings.TrimSpace(ref) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(ref))
+	return hex.EncodeToString(sum[:])
+}
+
+func classifyErr(err error) string {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "LLM call failed"):
+		return "llm"
+	case strings.Contains(s, "validation failed"):
+		return "validation_retry_exhausted"
+	case strings.Contains(s, "parse"):
+		return "parse"
+	case strings.Contains(s, "audit write failed"):
+		return "audit"
+	default:
+		return "analysis"
+	}
+}
+
+func (e *Engine) analyzeCategoryInner(ctx context.Context, cat Category, metrics map[string]float64, requestID string) (*Insight, error) {
 	// Step 1: Deterministic ground truth.
 	comp := computeAnalysis(cat, metrics)
 
@@ -367,10 +495,17 @@ func (e *Engine) analyzeCategoryInner(ctx context.Context, cat Category, metrics
 	// pass. Return the deterministic insufficient-data insight directly.
 	if comp.severity == SeverityUnavailable {
 		ins := e.buildFallbackInsight(cat, comp)
+		detail := []string{}
+		if len(comp.missing) > 0 {
+			detail = append(detail, "missing: "+strings.Join(comp.missing, ", "))
+		}
+		if len(comp.invalid) > 0 {
+			detail = append(detail, "invalid (non-finite): "+strings.Join(comp.invalid, ", "))
+		}
 		ins.Violations = append(ins.Violations, Violation{
 			Kind:     "unavailable",
 			Enforced: string(SeverityUnavailable),
-			Detail:   "required metric(s) absent: " + strings.Join(comp.missing, ", "),
+			Detail:   strings.Join(detail, "; "),
 		})
 		return ins, nil
 	}
@@ -382,7 +517,29 @@ func (e *Engine) analyzeCategoryInner(ctx context.Context, cat Category, metrics
 	if e.rag != nil && cat.RAGQuery != "" {
 		var err error
 		ragResults, err = e.rag.Search(ctx, cat.RAGQuery, e.cfg.RAGTopK)
-		if err == nil && len(ragResults) > 0 {
+		if err != nil || len(ragResults) == 0 {
+			if cat.RequireRAG {
+				// Fail closed: required evidence is unavailable, so make no
+				// determination and record the retrieval failure.
+				detail := "required retrieval returned no results"
+				if err != nil {
+					detail = "required retrieval failed: " + err.Error()
+				}
+				_ = e.emitAudit(ctx, AuditEvent{
+					Time: time.Now(), Kind: "retrieval_failed", CategoryID: cat.ID,
+					RequestID: requestID, Model: LLMModel, CategoryVersion: cat.Version,
+					ErrorKind: "retrieval", Detail: detail,
+				})
+				ins := e.buildFallbackInsight(cat, comp)
+				ins.Severity = SeverityUnavailable
+				ins.Text = "Insufficient evidence: required reference retrieval was unavailable, so no determination could be made."
+				ins.Violations = append(ins.Violations, Violation{
+					Kind: "rag_unavailable", Enforced: string(SeverityUnavailable), Detail: detail,
+				})
+				return ins, nil
+			}
+			// Optional RAG: proceed without retrieved context.
+		} else {
 			ragContext = e.buildRAGContext(ragResults)
 		}
 	}
@@ -491,6 +648,7 @@ type computedAnalysis struct {
 	lines       []metricLine
 	allowed     []float64
 	missing     []string // required metrics that were absent from the input
+	invalid     []string // metrics supplied as non-finite (NaN/±Inf)
 }
 
 type metricLine struct {
@@ -509,6 +667,7 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
 	var refs []string
 
 	evaluated := 0
+	missingRequired := 0
 	for _, t := range cat.Thresholds {
 		if t.SourceURL != "" {
 			key := t.Source + "|" + t.SourceURL
@@ -518,9 +677,31 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
 			}
 		}
 
+		// A non-finite bound makes the threshold uncomputable. Registration
+		// validation should catch this, but never silently evaluate against it.
+		if !isFinite(t.Min) || !isFinite(t.Max) {
+			c.invalid = append(c.invalid, t.Metric)
+			if !t.Optional {
+				missingRequired++
+			}
+			continue
+		}
+
 		val, ok := metrics[t.Metric]
 		if !ok {
 			c.missing = append(c.missing, t.Metric)
+			if !t.Optional {
+				missingRequired++
+			}
+			continue
+		}
+		// Reject non-finite inputs: NaN < Min and NaN > Max are both false, so a
+		// NaN would otherwise fall through to "WITHIN range" and read as success.
+		if !isFinite(val) {
+			c.invalid = append(c.invalid, t.Metric)
+			if !t.Optional {
+				missingRequired++
+			}
 			continue
 		}
 		evaluated++
@@ -555,14 +736,94 @@ func computeAnalysis(cat Category, metrics map[string]float64) computedAnalysis 
 
 	if cat.Educational {
 		c.severity = SeverityInfo
-	} else if len(cat.Thresholds) > 0 && evaluated == 0 {
-		// Required metrics were supplied for none of the thresholds. A missing
-		// input must never read as "success" — report it explicitly.
+	} else if len(cat.Thresholds) > 0 && (missingRequired > 0 || evaluated == 0) {
+		// Any required metric missing or non-finite (or nothing evaluable at all)
+		// means no determination can be made. A missing/invalid input must never
+		// read as "success".
 		c.severity = SeverityUnavailable
 	}
 	c.metricsText = sb.String()
 	c.reference = strings.Join(refs, "; ")
 	return c
+}
+
+// isFinite reports whether f is a usable real number (not NaN or ±Inf).
+func isFinite(f float64) bool { return !math.IsNaN(f) && !math.IsInf(f, 0) }
+
+// --- deep-copy helpers: getters return copies so callers cannot mutate
+// internal engine/audit state (drafts, categories, domains, audit entries). ---
+
+func cloneStrings(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, len(s))
+	copy(out, s)
+	return out
+}
+
+func cloneStringMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneFloatMap(m map[string]float64) map[string]float64 {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]float64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// cloneThresholds is a full copy: Threshold has only scalar fields.
+func cloneThresholds(t []Threshold) []Threshold {
+	if t == nil {
+		return nil
+	}
+	out := make([]Threshold, len(t))
+	copy(out, t)
+	return out
+}
+
+func cloneCategory(c Category) Category {
+	c.Thresholds = cloneThresholds(c.Thresholds)
+	return c
+}
+
+func cloneCategoryPtr(c *Category) *Category {
+	if c == nil {
+		return nil
+	}
+	cc := cloneCategory(*c)
+	return &cc
+}
+
+func cloneInsight(i *Insight) *Insight {
+	if i == nil {
+		return nil
+	}
+	ci := *i
+	ci.RelatedMetrics = cloneStrings(i.RelatedMetrics)
+	ci.Metadata = cloneStringMap(i.Metadata)
+	if i.Violations != nil {
+		v := make([]Violation, len(i.Violations))
+		copy(v, i.Violations)
+		ci.Violations = v
+	}
+	if i.SuggestedGoal != nil {
+		g := *i.SuggestedGoal
+		ci.SuggestedGoal = &g
+	}
+	return &ci
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +927,7 @@ func enforceGoal(g *SuggestedGoal, cat Category, c computedAnalysis) *Violation 
 		}
 	}
 
-	if !floatEq(g.Target, target) || g.Unit != th.Unit || g.Comparison != cmp {
+	if !sameAtDisplay(g.Target, target) || g.Unit != th.Unit || g.Comparison != cmp {
 		orig := fmt.Sprintf("target=%.2f unit=%s cmp=%s", g.Target, g.Unit, g.Comparison)
 		g.Target, g.Unit, g.Comparison = target, th.Unit, cmp
 		return &Violation{Kind: "goal", LLMValue: orig,
@@ -678,10 +939,16 @@ func enforceGoal(g *SuggestedGoal, cat Category, c computedAnalysis) *Violation 
 
 func (c computedAnalysis) renderText() string {
 	if len(c.lines) == 0 {
+		parts := []string{}
 		if len(c.missing) > 0 {
-			return fmt.Sprintf(
-				"Insufficient data: the required metric(s) %s were not provided, so no determination could be made.",
-				strings.Join(c.missing, ", "))
+			parts = append(parts, "missing: "+strings.Join(c.missing, ", "))
+		}
+		if len(c.invalid) > 0 {
+			parts = append(parts, "invalid (non-finite): "+strings.Join(c.invalid, ", "))
+		}
+		if len(parts) > 0 {
+			return "Insufficient data: required metric(s) could not be evaluated (" +
+				strings.Join(parts, "; ") + "), so no determination could be made."
 		}
 		return "Insufficient data: no metrics were available, so no determination could be made."
 	}
@@ -733,7 +1000,7 @@ func (c computedAnalysis) unknownNumbers(text string) []string {
 
 func (c computedAnalysis) isAllowed(n float64) bool {
 	for _, a := range c.allowed {
-		if floatEq(a, n) {
+		if sameAtDisplay(a, n) {
 			return true
 		}
 	}
@@ -744,9 +1011,18 @@ func parseNum(tok string) (float64, error) {
 	return strconv.ParseFloat(strings.ReplaceAll(tok, ",", ""), 64)
 }
 
-func floatEq(a, b float64) bool {
-	tol := math.Max(0.01, 0.005*math.Abs(a))
-	return math.Abs(a-b) <= tol
+// displayDecimals is the precision at which metric values are presented to the
+// model (the "%.2f" metric/guideline formatting). Traceability is checked at
+// exactly this precision: a number in the narrative is allowed only if it
+// renders identically to a computed or threshold value. This is exact matching
+// at display precision — there is no tolerance window in which a fabricated
+// "close" number could pass as traceable (C-04). Keep this in sync with the
+// "%.2f" formatting used to build prompts.
+const displayDecimals = 2
+
+func sameAtDisplay(a, b float64) bool {
+	return strconv.FormatFloat(a, 'f', displayDecimals, 64) ==
+		strconv.FormatFloat(b, 'f', displayDecimals, 64)
 }
 
 func truncate(s string, maxLen int) string {
