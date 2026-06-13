@@ -10,11 +10,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.21'
-          check-latest: true
+          # Build and vuln-check against the current patched Go toolchain.
+          # go.mod's 'go 1.21' directive remains the minimum supported version;
+          # pinning CI to EOL 1.21 reported already-patched stdlib CVEs.
+          go-version: 'stable'
+          # Only integrations/postgres has external deps (a go.sum); point the
+          # module cache there so the root module doesn't warn about a missing one.
+          cache-dependency-path: integrations/postgres/go.sum
 
       - name: Build
         run: go build ./...
