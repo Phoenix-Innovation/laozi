@@ -97,6 +97,9 @@ type Category struct {
 	RequireRAG bool `json:"require_rag,omitempty"`
 	// Version identifies the category definition for the audit trail.
 	Version string `json:"version,omitempty"`
+	// SafeAdvice overrides the redirect substituted when this category's
+	// narration is sanitized (e.g. clinical: "Contact your doctor right away.").
+	SafeAdvice string `json:"safe_advice,omitempty"`
 }
 
 // Insight is the output from analysis. The Violations slice is the audit
@@ -207,6 +210,7 @@ type Engine struct {
 	reviewer    Reviewer
 	audit       AuditSink
 	auditStrict bool
+	safeAdvice  string // redirect substituted when narration is sanitized
 }
 
 // New creates a new Laozi engine.
@@ -229,6 +233,12 @@ type Option func(*Engine)
 // WithLLM sets the LLM client.
 func WithLLM(client LLMClient) Option {
 	return func(e *Engine) { e.llm = client }
+}
+
+// WithSafeAdvice sets the engine-wide redirect text substituted when narration
+// is sanitized (overridden per category by Category.SafeAdvice).
+func WithSafeAdvice(advice string) Option {
+	return func(e *Engine) { e.safeAdvice = advice }
 }
 
 // WithRAG enables optional RAG support.
@@ -885,18 +895,151 @@ func (e *Engine) enforce(insight *Insight, cat Category, c computedAnalysis, rag
 		}
 	}
 
-	// 4. Numbers in prose — heuristic trace check.
-	if bad := c.unknownNumbers(insight.Text); len(bad) > 0 {
+	// 4. Prose safety — checked against the ORIGINAL narration, then a single
+	//    safe rewrite if anything unsafe is found.
+	origText := insight.Text
+	needsSafeText := false
+
+	// 4a. Numbers not traceable to data/thresholds (rewrite only under strict).
+	if bad := c.unknownNumbers(origText); len(bad) > 0 {
 		v := Violation{
 			Kind: "number", LLMValue: strings.Join(bad, ", "),
 			Detail: "narrative contains numbers not traceable to data or thresholds",
 		}
 		if e.strict {
-			insight.Text = c.renderText()
+			needsSafeText = true
 			v.Enforced = "narration replaced with deterministic template"
 		}
 		insight.Violations = append(insight.Violations, v)
 	}
+
+	// 4b. Directional contradiction (S-01): narration asserts a direction that
+	//     disagrees with the engine-computed status. Always fail closed.
+	if contra := directionalContradictions(origText, c); len(contra) > 0 {
+		needsSafeText = true
+		insight.Violations = append(insight.Violations, Violation{
+			Kind: "directional_contradiction", LLMValue: origText,
+			Enforced: "narration replaced with deterministic template",
+			Detail:   "narrative asserted a direction contradicting the computed status: " + strings.Join(contra, "; "),
+		})
+	}
+
+	// 4c. Clinical/treatment directive (S-02): this product gives findings and
+	//     "seek care" advice only — never an action directive. Always fail closed.
+	if imp := clinicalDirectives(origText); len(imp) > 0 {
+		needsSafeText = true
+		insight.Violations = append(insight.Violations, Violation{
+			Kind: "clinical_directive", LLMValue: origText,
+			Enforced: "directive removed; replaced with safe guidance",
+			Detail:   "narrative issued a treatment/medication directive: " + strings.Join(imp, ", "),
+		})
+	}
+
+	if needsSafeText {
+		insight.Text = c.renderText()
+		if adv := e.resolveSafeAdvice(cat); adv != "" {
+			insight.Text = strings.TrimRight(insight.Text, "\n ") + " " + adv
+		}
+	}
+}
+
+// resolveSafeAdvice picks the redirect text: per-category, else per-engine, else default.
+func (e *Engine) resolveSafeAdvice(cat Category) string {
+	if strings.TrimSpace(cat.SafeAdvice) != "" {
+		return cat.SafeAdvice
+	}
+	if strings.TrimSpace(e.safeAdvice) != "" {
+		return e.safeAdvice
+	}
+	return DefaultSafeAdvice
+}
+
+func statusClass(status string) string {
+	switch {
+	case strings.HasPrefix(status, "BELOW"):
+		return "BELOW"
+	case strings.HasPrefix(status, "ABOVE"):
+		return "ABOVE"
+	case strings.HasPrefix(status, "WITHIN"):
+		return "WITHIN"
+	default:
+		return ""
+	}
+}
+
+var (
+	reBelow  = regexp.MustCompile(`(?i)\b(below|under|beneath|underneath|less than|lower than|too low|fell? below|drops? below|deficient)\b`)
+	reAbove  = regexp.MustCompile(`(?i)\b(above|over|exceed(s|ed|ing)?|higher than|greater than|too high|elevated|out of range)\b`)
+	reWithin = regexp.MustCompile(`(?i)\b(within|in range|in the range|in the normal range|normal range|normal|safely within|in the safe range)\b`)
+)
+
+func directionClassesIn(s string) []string {
+	var out []string
+	if reBelow.MatchString(s) {
+		out = append(out, "BELOW")
+	}
+	if reAbove.MatchString(s) {
+		out = append(out, "ABOVE")
+	}
+	if reWithin.MatchString(s) {
+		out = append(out, "WITHIN")
+	}
+	return out
+}
+
+func splitSentences(text string) []string {
+	return regexp.MustCompile(`[.!?;\n]+`).Split(text, -1)
+}
+
+// directionalContradictions reports, per metric, any direction/containment claim
+// in the narration that disagrees with the engine-computed status (S-01).
+func directionalContradictions(text string, c computedAnalysis) []string {
+	lower := strings.ToLower(text)
+	sentences := splitSentences(lower)
+	seen := map[string]bool{}
+	var out []string
+	for _, ln := range c.lines {
+		want := statusClass(ln.status)
+		if want == "" || ln.metric == "" {
+			continue
+		}
+		name := strings.ToLower(ln.metric)
+		nameRe := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(name) + `\b`)
+		for _, sent := range sentences {
+			if !nameRe.MatchString(sent) {
+				continue
+			}
+			for _, claim := range directionClassesIn(sent) {
+				if claim != want {
+					key := ln.metric + claim
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, fmt.Sprintf("%s: narration says %s, computed %s", ln.metric, claim, want))
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// clinicalDirectives reports treatment/medication action directives in the
+// narration (S-02). Heuristic and intentionally fail-closed: a match is rewritten
+// to safe guidance, so over-matching is the safe direction.
+var reClinicalDirective = regexp.MustCompile(`(?i)\b(stop|start|begin|discontinue|increase|decrease|reduce|raise|lower|adjust|change|switch|take|administer|inject|double|halve|skip|cease|quit)\b[^.?!]{0,40}\b(insulin|medication|medications|meds|dose|dosage|drug|drugs|prescription|prescribed|pill|pills|tablet|tablets|injection|treatment|therapy|metformin|warfarin|statin|aspirin|antibiotic|chemo|chemotherapy)\b`)
+
+func clinicalDirectives(text string) []string {
+	matches := reClinicalDirective.FindAllString(text, -1)
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range matches {
+		m = strings.TrimSpace(m)
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func referenceMatches(ref string, cat Category, ragResults []RAGResult) bool {

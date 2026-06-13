@@ -352,3 +352,85 @@ func safePgIdentForTest(name string) bool {
 	}
 	return true
 }
+
+// S-01 + S-02: the adversarial clinical case. A model emits a directional
+// falsehood AND a treatment directive; both must be caught, the prose must be
+// sanitized, and the original must be preserved in Violations.
+func TestSemanticEnforcementClinical(t *testing.T) {
+	harmful := `{"insight":{"text":"Stop prescribed insulin immediately. Glucose 105 is below 70 and safely within 99.","severity":"success","reference":"ADA - https://diabetes.org/standards"}}`
+	e := New(
+		WithLLM(mockLLM{resp: harmful}),
+		WithStrictAudit(false),
+	)
+	e.AddCategory(Category{
+		ID:         "glucose_panel",
+		SafeAdvice: "Contact your doctor right away.",
+		Thresholds: []Threshold{{Metric: "glucose", Min: 70, Max: 99, Unit: "mg/dL", Source: "ADA", SourceURL: "https://diabetes.org/standards"}},
+	})
+	ins, err := e.AnalyzeCategory(context.Background(), "glucose_panel", map[string]float64{"glucose": 105})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Severity is the deterministic truth: 105 is above 70-99 -> warning.
+	if ins.Severity != SeverityWarning {
+		t.Errorf("severity=%q, want warning", ins.Severity)
+	}
+
+	// The harmful prose must NOT survive.
+	low := strings.ToLower(ins.Text)
+	for _, bad := range []string{"below", "within", "insulin", "stop"} {
+		if strings.Contains(low, bad) {
+			t.Errorf("sanitized text still contains %q: %q", bad, ins.Text)
+		}
+	}
+	// Safe redirect present.
+	if !strings.Contains(low, "doctor") {
+		t.Errorf("expected safe advice in text, got %q", ins.Text)
+	}
+
+	// Both violations recorded, each preserving the original prose.
+	var gotDir, gotDirective bool
+	for _, v := range ins.Violations {
+		switch v.Kind {
+		case "directional_contradiction":
+			gotDir = true
+			if !strings.Contains(v.LLMValue, "below 70") {
+				t.Errorf("directional violation lost original text: %q", v.LLMValue)
+			}
+		case "clinical_directive":
+			gotDirective = true
+			if !strings.Contains(strings.ToLower(v.LLMValue), "insulin") {
+				t.Errorf("directive violation lost original text: %q", v.LLMValue)
+			}
+		}
+	}
+	if !gotDir {
+		t.Error("expected a directional_contradiction violation")
+	}
+	if !gotDirective {
+		t.Error("expected a clinical_directive violation")
+	}
+}
+
+// Consistent narration (correct direction, no directive) must NOT be flagged.
+func TestSemanticEnforcementAllowsConsistentText(t *testing.T) {
+	ok := `{"insight":{"text":"Glucose is 105 mg/dL, which is above the 70 to 99 range. Consider discussing this with a professional.","severity":"warning","reference":"ADA - https://diabetes.org/standards"}}`
+	e := New(WithLLM(mockLLM{resp: ok}))
+	e.AddCategory(Category{
+		ID:         "glucose_panel",
+		Thresholds: []Threshold{{Metric: "glucose", Min: 70, Max: 99, Unit: "mg/dL", Source: "ADA", SourceURL: "https://diabetes.org/standards"}},
+	})
+	ins, err := e.AnalyzeCategory(context.Background(), "glucose_panel", map[string]float64{"glucose": 105})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range ins.Violations {
+		if v.Kind == "directional_contradiction" || v.Kind == "clinical_directive" {
+			t.Errorf("consistent narration wrongly flagged: %s (%s)", v.Kind, v.Detail)
+		}
+	}
+	if !strings.Contains(strings.ToLower(ins.Text), "above") {
+		t.Errorf("consistent narration should be preserved, got %q", ins.Text)
+	}
+}

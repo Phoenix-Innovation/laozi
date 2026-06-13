@@ -69,7 +69,13 @@ var ValidSeverities = []Severity{SeverityWarning, SeveritySuccess, SeverityInfo,
 
 // PromptVersion identifies the prompt-template generation for the audit trail.
 // Bump it whenever the prompt templates change in a way that affects output.
-const PromptVersion = "metric/v1"
+const PromptVersion = "metric/v2"
+
+// DefaultSafeAdvice is the fallback redirect substituted when narration is
+// sanitized (e.g. a clinical directive is removed). Deployments should override
+// it per category (Category.SafeAdvice) or per engine (WithSafeAdvice) — e.g. a
+// clinical deployment would use "Contact your doctor right away."
+const DefaultSafeAdvice = "If anything here is concerning, please consult a qualified professional."
 
 // ================================================================================
 // PROMPT TEMPLATES (text/template syntax; rendered in laozi.go)
@@ -84,6 +90,13 @@ RULES:
 3. Compare actual values to thresholds explicitly
 4. Include the source URL in your reference
 5. Use ONLY numbers from the provided data and thresholds in your narrative
+6. The comparison result for each metric (ABOVE / BELOW / WITHIN range) is
+   COMPUTED FOR YOU in "ACTUAL VALUES WITH COMPARISON". State it EXACTLY as
+   given. NEVER describe a value as below/under when it is ABOVE the range, or
+   as within/normal when it is OUTSIDE the range.
+7. Provide informational findings only. You MAY advise contacting a qualified
+   professional. You MUST NOT instruct the user to start, stop, change, adjust,
+   skip, or take any medication, dose, treatment, or other clinical action.
 
 SEVERITY:
 - "warning" = value OUTSIDE the threshold range
@@ -108,7 +121,7 @@ EXPECTED SEVERITY: {{.ExpectedSeverity}}
 OUTPUT (use severity="{{.ExpectedSeverity}}"):
 {
   "insight": {
-    "text": "[State value, compare to threshold, give advice]",
+    "text": "[State the value and its comparison result EXACTLY as given above (above/below/within range); do NOT contradict it. Informational only - do not instruct any medication or treatment change.]",
     "severity": "{{.ExpectedSeverity}}",
     "reference": "[Source from guidelines] - [URL]",
     "suggested_goal": { "metric": "{{.MetricName}}", "target": [threshold_value], "unit": "[unit]", "comparison": "gte", "description": "..." }
